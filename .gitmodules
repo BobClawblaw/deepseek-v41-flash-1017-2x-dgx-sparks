@@ -1,0 +1,3 @@
+[submodule "vendor/deepseek-v41-tensorfold-spark"]
+	path = vendor/deepseek-v41-tensorfold-spark
+	url = https://github.com/jayleaton/deepseek-v41-tensorfold-spark.git

@@ -1,0 +1,52 @@
+# DeepSeek-V4.1-Flash-1017 at EXL3 2.9 bpw (LibertAIDAI's pack, Mia-AiLab's layout) on two DGX Sparks at TP=2,
+# served by jayleaton's recipe (github.com/jayleaton/deepseek-v41-tensorfold-spark, Python engine: TensorFold 0.6.0 +
+# its patches). The ruler is the GLM EXL3 recipe's (any OpenAI endpoint). Machine paths go in the .local.toml.
+name = "dsv41-1017-gb10"
+description = "DeepSeek-V4.1-Flash-1017 EXL3 2.9 bpw, jayleaton's DeepSeek-V4.1 recipe (Python, TensorFold 0.6.0 + patches), TP=2 on two DGX Sparks, 4 slots"
+model_name = "DeepSeek-V4.1-Flash-1017 EXL3 2.9bpw"
+hardware = "2x NVIDIA DGX Spark (GB10, 128 GB unified each), TP=2 over RoCE"
+engine = "TensorFold 0.6.0 (Python) + jayleaton's DeepSeek-V4.1 patches, recipe defaults (replay prefill, DSpark drafts)"
+url = "http://127.0.0.1:$port"
+model = "DeepSeek-V4.1-Flash-TF"
+
+[vars]
+recipe = "CHANGE-ME: a checkout of jayleaton/deepseek-v41-tensorfold-spark with config/prod.env"
+suite_dir = "CHANGE-ME: a checkout of the GLM EXL3 recipe (bench/ruler.py)"
+pack = "CHANGE-ME: the head's copy of the EXL3 pack (HEAD_MODEL)"
+port = "8000"
+
+[commands]
+up = "cd $recipe && scripts/serve.sh start"
+down = "cd $recipe && scripts/serve.sh stop"
+status = "cd $recipe && scripts/serve.sh status"
+ruler = "cd $suite_dir && python3 bench/ruler.py --url $url --model $model --concurrency $concurrency --json $out $args"
+suite = "cd $suite_dir && python3 -m quality.suite --url $url --model $model --out $out $args"
+
+[session]
+lock = "~/.cache/tf-gpu-pair.lock"
+up_retries = 1
+retry_wait = 90
+up_timeout = 1800
+health_wait = 120
+leave_up = true
+
+[[identity]]
+name = "image"
+cmd = "docker image inspect dsv41-tensorfold:060 --format '{{.Id}}' | cut -c8-23"
+
+[[identity]]
+name = "pack"
+cmd = "sha256sum $pack/model.safetensors.index.json | cut -c1-16"
+
+[[memory]]
+name = "head"
+cmd = "free -b"
+
+[features]
+drafts = true
+structured = true
+sampling = true
+vision_urls = false
+capacity = false
+thinking = true
+prompt_cache = true

@@ -1,0 +1,19 @@
+description = "Quality, thinking off and on (2-3 hours), on the server as it is: the suite's parts the GLM quality runs completed (drafts, behaviour, tools, json, ifeval, gsm8k, mgsm, mmlu, math500), the harness's thinking problems, the suite's gsm8k and ifeval with thinking on"
+restart = false
+
+[[checks]]
+type = "memory"
+name = "memory-idle"
+
+[[checks]]
+type = "suite"
+args = "--only drafts behaviour tools json ifeval gsm8k mgsm mmlu math500"
+
+[[checks]]
+type = "thinking"
+max_tokens = 8192
+
+[[checks]]
+type = "suite"
+name = "suite-thinking"
+args = "--only gsm8k ifeval --thinking"
