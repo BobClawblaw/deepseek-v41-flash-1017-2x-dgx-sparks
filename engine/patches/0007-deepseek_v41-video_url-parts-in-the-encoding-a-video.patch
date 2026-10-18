@@ -1,0 +1,211 @@
+From 1dff280c2e77cdbbf8bf0b300ea3265c81798f66 Mon Sep 17 00:00:00 2001
+From: BobClawblaw <BobClawblaw@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 02:48:11 +0000
+Subject: [PATCH 7/9] deepseek_v41: video_url parts in the encoding (a video
+ hook, else the image part's treatment) and their sentinels in the marker
+
+---
+ .../families/deepseek_v41/serve/template.zig  | 44 +++++++++++--
+ .../families/deepseek_v41/vision/parts.zig    | 63 ++++++++++++++++---
+ 2 files changed, 93 insertions(+), 14 deletions(-)
+
+diff --git a/zig/src/families/deepseek_v41/serve/template.zig b/zig/src/families/deepseek_v41/serve/template.zig
+index 8ade1ac8..988388f2 100644
+--- a/zig/src/families/deepseek_v41/serve/template.zig
++++ b/zig/src/families/deepseek_v41/serve/template.zig
+@@ -55,6 +55,8 @@ pub const Options = struct {
+     response_format: ?Value = null,
+     add_generation_prompt: bool = true,
+     image: ?ImageHook = null,
++    /// What a ``video_url`` part renders as (TF_DSV41_IMAGES=native: its frames' sentinel); null: as an image part.
++    video: ?ImageHook = null,
+ };
+ 
+ /// A refusal's message (HTTP 400), set when ``render`` returns error.Refused.
+@@ -146,7 +148,8 @@ fn isImagePart(t: []const u8) bool {
+ }
+ 
+ /// OpenAI ``content``: a string, null, or a list of text parts joined by blank lines; image parts through the hook.
+-fn text(r: *R, content: ?Value, where: []const u8, index: usize, image: ?ImageHook) Error![]const u8 {
++fn text(r: *R, content: ?Value, where: []const u8, index: usize, o: Options) Error![]const u8 {
++    const image = o.image;
+     const v = content orelse return "";
+     switch (v) {
+         .null => return "",
+@@ -169,6 +172,10 @@ fn text(r: *R, content: ?Value, where: []const u8, index: usize, image: ?ImageHo
+                         } else if (isImagePart(name)) {
+                             const hook = image orelse return r.refuse("messages[{d}].{s}: images are not served by this DeepSeek-V4.1 build", .{ index, where });
+                             try out.appendSlice(r.a, hook.text(hook.ctx, part));
++                        } else if (std.mem.eql(u8, name, "video_url")) {
++                            // an image model: a video is its frames (native), else what an image part gets
++                            const hook = o.video orelse image orelse return r.refuse("messages[{d}].{s}: videos are not served by this DeepSeek-V4.1 build", .{ index, where });
++                            try out.appendSlice(r.a, hook.text(hook.ctx, part));
+                         } else return r.refuse("messages[{d}].{s}: unsupported content part of type {s}", .{ index, where, if (name.len > 0) name else "(none)" });
+                     },
+                     else => return r.refuse("messages[{d}].{s}: unsupported content part", .{ index, where }),
+@@ -306,21 +313,21 @@ fn messagesOf(r: *R, messages: Value, o: Options) Error![]Msg {
+         var msg: Msg = .{ .role = role };
+         switch (role) {
+             .assistant => {
+-                msg.content = try text(r, m.get("content"), "content", i, o.image);
++                msg.content = try text(r, m.get("content"), "content", i, o);
+                 var rc = m.get("reasoning_content") orelse Value.null;
+                 if (rc == .null) rc = m.get("reasoning") orelse Value.null;
+-                if (rc != .null) msg.reasoning = try text(r, rc, "reasoning_content", i, null);
++                if (rc != .null) msg.reasoning = try text(r, rc, "reasoning_content", i, .{});
+                 if (m.get("tool_calls")) |tc| if (tc.truthy()) {
+                     if (tc != .array) return r.refuse("messages[{d}].tool_calls must be a list", .{i});
+                     msg.calls = tc.array;
+                 };
+             },
+             .tool => {
+-                msg.content = try text(r, m.get("content"), "content", i, o.image);
++                msg.content = try text(r, m.get("content"), "content", i, o);
+                 const id = m.get("tool_call_id") orelse Value.null;
+                 msg.tool_id = if (id == .string) id.string else if (id.truthy()) try dumps(r.a, id) else "";
+             },
+-            else => msg.content = try text(r, m.get("content"), "content", i, o.image),
++            else => msg.content = try text(r, m.get("content"), "content", i, o),
+         }
+         try list.append(r.a, msg);
+     }
+@@ -477,3 +484,30 @@ test "a thinking conversation with a tool call and an out-of-order result" {
+     try std.testing.expectEqual(@as(?u8, null), budgetOf(.{ .string = "none" }));
+     try std.testing.expectEqual(@as(?u8, null), budgetOf(.{ .int = "101" }));
+ }
++
++test "a video_url part: refused without an image hook, the image hook's text without a video hook, else the video hook's" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const x = arena.allocator();
++    const msgs = (try json.parseText(x,
++        \\[{"role":"user","content":[{"type":"text","text":"what happens"},{"type":"video_url","video_url":{"url":"data:video/mp4;base64,AA=="}}]}]
++    )).ok;
++    const Hooks = struct {
++        fn notice(_: ?*anyopaque, _: Value) []const u8 {
++            return "[image omitted]";
++        }
++        fn frames(_: ?*anyopaque, part: Value) []const u8 {
++            return if (part.get("video_url") != null) "[frames]" else "?";
++        }
++    };
++    var problem: Problem = .{};
++    // TF_DSV41_IMAGES=reject: refused as an image part is
++    try std.testing.expectError(error.Refused, render(x, msgs, .{ .thinking = false }, &problem));
++    try std.testing.expectEqualStrings("messages[0].content: videos are not served by this DeepSeek-V4.1 build", problem.message);
++    // placeholder: the image part's notice
++    const placeholder = try render(x, msgs, .{ .thinking = false, .image = .{ .text = Hooks.notice } }, &problem);
++    try std.testing.expect(std.mem.indexOf(u8, placeholder, "what happens\n\n[image omitted]") != null);
++    // native: the video hook
++    const native = try render(x, msgs, .{ .thinking = false, .image = .{ .text = Hooks.notice }, .video = .{ .text = Hooks.frames } }, &problem);
++    try std.testing.expect(std.mem.indexOf(u8, native, "what happens\n\n[frames]") != null);
++}
+diff --git a/zig/src/families/deepseek_v41/vision/parts.zig b/zig/src/families/deepseek_v41/vision/parts.zig
+index 0c8cc158..27ffe593 100644
+--- a/zig/src/families/deepseek_v41/vision/parts.zig
++++ b/zig/src/families/deepseek_v41/vision/parts.zig
+@@ -40,11 +40,21 @@ pub fn partUrl(a: Allocator, part: Value) error{ Refused, OutOfMemory }![]const
+     return error.Refused;
+ }
+ 
+-/// The image parts as sentinels (``Marker``): ``hook`` is ``template.ImageHook.text``; ``splice`` after rendering.
++/// An OpenAI ``video_url`` part's URL: ``{"video_url": {"url": ...}}`` or ``{"video_url": "..."}``.
++pub fn videoUrl(part: Value) error{Refused}![]const u8 {
++    var v = part.get("video_url") orelse return error.Refused;
++    if (v == .object) v = v.get("url") orelse return error.Refused;
++    if (v == .string and v.string.len > 0) return v.string;
++    return error.Refused;
++}
++
++/// The image (and video) parts as sentinels (``Marker``): ``hook`` is ``template.ImageHook.text``; ``splice`` after rendering.
+ pub const Marker = struct {
+     a: Allocator,
+     nonce: [12]u8,
+     urls: std.ArrayList([]const u8) = .empty,
++    /// per part (as ``urls``): a video part's
++    videos: std.ArrayList(bool) = .empty,
+     problem: ?[]const u8 = null,
+ 
+     pub fn init(a: Allocator, io: std.Io) Marker {
+@@ -66,16 +76,47 @@ pub const Marker = struct {
+             if (m.problem == null) m.problem = if (e == error.OutOfMemory) "out of memory" else std.fmt.allocPrint(m.a, "an {s} part needs a URL (image_url.url)", .{part.strField("type") orelse "image"}) catch "an image part needs a URL";
+             return "";
+         };
++        return m.add(url, false);
++    }
++
++    /// One video part -> its sentinel (``template.Options.video``); ``spliceWith`` gives it its frames' text.
++    pub fn videoHook(ctx: ?*anyopaque, part: Value) []const u8 {
++        const m: *Marker = @ptrCast(@alignCast(ctx.?));
++        const url = videoUrl(part) catch {
++            if (m.problem == null) m.problem = "a video_url part needs a URL (video_url.url)";
++            return "";
++        };
++        return m.add(url, true);
++    }
++
++    fn add(m: *Marker, url: []const u8, video: bool) []const u8 {
+         m.urls.append(m.a, url) catch {
+             m.problem = "out of memory";
+             return "";
+         };
++        m.videos.append(m.a, video) catch {
++            m.problem = "out of memory";
++            return "";
++        };
+         var buf: [64]u8 = undefined;
+         return m.a.dupe(u8, m.tag(&buf, m.urls.items.len - 1)) catch "";
+     }
+ 
++    pub const Spliced = struct {
++        text: []u8,
++        /// the parts' URLs in prompt order
++        urls: [][]const u8,
++        /// the parts' own indices (``urls`` / ``videos``) in prompt order
++        order: []usize,
++    };
++
+     /// The rendered text with each sentinel as the placeholder, and the URLs in prompt order.
+-    pub fn splice(m: *Marker, text: []const u8, problem: *Problem) error{ Refused, OutOfMemory }!struct { text: []u8, urls: [][]const u8 } {
++    pub fn splice(m: *Marker, text: []const u8, problem: *Problem) error{ Refused, OutOfMemory }!Spliced {
++        return m.spliceWith(text, &.{}, problem);
++    }
++
++    /// ``splice``, part ``i``'s sentinel as ``texts[i]`` when that is given (a video's frames), else the placeholder.
++    pub fn spliceWith(m: *Marker, text: []const u8, texts: []const ?[]const u8, problem: *Problem) error{ Refused, OutOfMemory }!Spliced {
+         if (m.problem) |p| return refuse(problem, p);
+         if (std.mem.indexOf(u8, text, IMAGE_PLACEHOLDER) != null) return refuse(problem, "the messages hold the image placeholder " ++ IMAGE_PLACEHOLDER ++ " as text: send images as image parts");
+         const n = m.urls.items.len;
+@@ -93,18 +134,22 @@ pub const Marker = struct {
+         while (std.mem.indexOf(u8, rest, "\x00tf-image-" ++ "")) |at| {
+             const end = std.mem.indexOfScalarPos(u8, rest, at + 1, 0) orelse return refuse(problem, "an image sentinel survived the prompt encoding");
+             const t = rest[at .. end + 1];
+-            const known = for (0..n) |i| {
+-                if (std.mem.eql(u8, t, m.tag(&buf, i))) break true;
+-            } else false;
+-            if (!known) return refuse(problem, "an image sentinel survived the prompt encoding");
++            const known: ?usize = for (0..n) |i| {
++                if (std.mem.eql(u8, t, m.tag(&buf, i))) break i;
++            } else null;
++            const i = known orelse return refuse(problem, "an image sentinel survived the prompt encoding");
+             try out.appendSlice(m.a, rest[0..at]);
+-            try out.appendSlice(m.a, IMAGE_PLACEHOLDER);
++            try out.appendSlice(m.a, if (i < texts.len) texts[i] orelse IMAGE_PLACEHOLDER else IMAGE_PLACEHOLDER);
+             rest = rest[end + 1 ..];
+         }
+         try out.appendSlice(m.a, rest);
+         const urls = try m.a.alloc([]const u8, n);
+-        for (order, urls) |o, *u| u.* = m.urls.items[o.i];
+-        return .{ .text = out.items, .urls = urls };
++        const idx = try m.a.alloc(usize, n);
++        for (order, urls, idx) |o, *u, *x| {
++            u.* = m.urls.items[o.i];
++            x.* = o.i;
++        }
++        return .{ .text = out.items, .urls = urls, .order = idx };
+     }
+ };
+ 
+-- 
+2.43.0
+

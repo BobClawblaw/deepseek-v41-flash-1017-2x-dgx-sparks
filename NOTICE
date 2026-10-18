@@ -1,25 +1,33 @@
 deepseek-v41-flash-1017-2x-dgx-sparks
 Copyright 2026 BobClawblaw
 
-This project's own scripts, configuration and documentation are licensed under the Apache License, Version 2.0
-(see LICENSE).
+This project's own scripts, patches, configuration and documentation are licensed under the Apache License,
+Version 2.0 (see LICENSE).
 
 It builds on:
+
+TensorFold
+  https://github.com/ashhart/TensorFold
+  Copyright 2026 TensorFold contributors. Apache License 2.0. engine/engine.sh clones it (main 9ccf4727) and merges
+  pull request #727's head (6e95bc6d), jayleaton's DeepSeek-V4.1 series, which keeps its authors' notices.
 
 deepseek-v41-tensorfold-spark
   https://github.com/jayleaton/deepseek-v41-tensorfold-spark
   Copyright 2026 Jay Leaton (https://x.com/jayleaton). Apache License 2.0.
   Included unmodified as the git submodule vendor/deepseek-v41-tensorfold-spark; its NOTICE applies to it.
-  Changes made here (Apache-2.0, section 4):
-  - patches/0001-serve-nccl-cumem-off.patch adds NCCL_CUMEM_HOST_ENABLE=0 and NCCL_CUMEM_ENABLE=0 to the
-    containers scripts/serve.sh starts;
-  - config/prod.env.example is the recipe's config/prod.env.example with the 1017 pack and Engram paths.
+  - engine/engine.sh copies the files engine/kit-overlay.txt lists from its engine/zig snapshot.
+  - engine/patches/ modify those files and TensorFold's: the kit engine on TensorFold main's APIs, native images on
+    main's server, the 1017 pack's fp16 tensors, and video input (Apache-2.0, section 4).
+  - docker/Dockerfile is its docker/zig/Dockerfile with this engine's binaries and libtfvideo added.
+  - config/native.env.example is its config/prod-zig.env.example with this recipe's values.
 
-TensorFold
-  https://github.com/ashhart/TensorFold
-  Apache License 2.0, through the recipe above.
+xgrammar (vendored in engine/patches by the kit engine's in-process structured output)
+  https://github.com/mlc-ai/xgrammar, Apache License 2.0; its license and notice travel with it.
 
-Model weights are not included. scripts/stage.sh downloads them from Hugging Face:
+FFmpeg (built into libtfvideo by docker/Dockerfile through TensorFold's tools/zig/build_ffmpeg.sh)
+  https://ffmpeg.org, LGPL-2.1-or-later as TensorFold configures it.
+
+Model weights are not included; scripts/stage.sh downloads them from Hugging Face:
   deepseek-ai/DeepSeek-V4.1-Flash-1017 (MIT, DeepSeek): the Engram tables and the image routing bias;
   LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw (MIT): the EXL3 pack;
   Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw (MIT): its chat_template.jinja.

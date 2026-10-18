@@ -1,0 +1,52 @@
+From dcc646a2fa559d3a125ad0bf266fa65c13746b69 Mon Sep 17 00:00:00 2001
+From: BobClawblaw <BobClawblaw@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 02:22:10 +0000
+Subject: [PATCH 1/9] deepseek_v41 (kit): keep the 1017 EXL3 pack's fp16
+ storage: fp32 natives and DSpark's confidence head widen at load
+
+---
+ zig/src/families/deepseek_v41/names.zig | 4 ++--
+ zig/src/families/deepseek_v41/plan.zig  | 5 ++++-
+ 2 files changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/families/deepseek_v41/names.zig b/zig/src/families/deepseek_v41/names.zig
+index 216feeb4..4aaa9493 100644
+--- a/zig/src/families/deepseek_v41/names.zig
++++ b/zig/src/families/deepseek_v41/names.zig
+@@ -83,7 +83,7 @@ pub fn expertName(block: []const u8, e: u32, p: ExpertProj, buf: []u8) ![]const
+ pub const Store = enum {
+     /// norms: bf16 in the pack (fp32 in the forward), fp32 accepted
+     norm,
+-    /// fp32 only (sinks, hc_*, router bias)
++    /// fp32 (sinks, hc_*, router bias); fp16 storage widens exactly (the 1017 EXL3 pack's router bias)
+     f32,
+     /// fp16 or bf16, rounded to bf16 once (router gate, indexer weights_proj, Markov heads)
+     half,
+@@ -91,7 +91,7 @@ pub const Store = enum {
+     pub fn accepts(s: Store, d: DType) bool {
+         return switch (s) {
+             .norm => d == .bf16 or d == .f32,
+-            .f32 => d == .f32,
++            .f32 => d == .f32 or d == .f16,
+             .half => d == .bf16 or d == .f16,
+         };
+     }
+diff --git a/zig/src/families/deepseek_v41/plan.zig b/zig/src/families/deepseek_v41/plan.zig
+index 277e9f90..cf383be0 100644
+--- a/zig/src/families/deepseek_v41/plan.zig
++++ b/zig/src/families/deepseek_v41/plan.zig
+@@ -253,7 +253,10 @@ const Builder = struct {
+             const info = try b.pack.need(name);
+             var n: u64 = 1;
+             for (info.dims()) |d| n *= d;
+-            if (info.dtype != .f32 and info.dtype != .bf16 or n != b.c.hidden + b.c.dspark_markov_rank) return error.UnexpectedTensor;
++            if (info.dtype != .f32 and info.dtype != .bf16 and info.dtype != .f16 or n != b.c.hidden + b.c.dspark_markov_rank) { // widened at load
++                log.warn("{s}: {t}, {d} values, expected fp32, bf16 or fp16 of {d}", .{ name, info.dtype, n, b.c.hidden + b.c.dspark_markov_rank });
++                return error.UnexpectedTensor;
++            }
+             try b.mark(name);
+             confidence = .{ .name = try b.dupe(name), .info = info, .slice = .whole, .bytes = info.nbytes };
+         }
+-- 
+2.43.0
+

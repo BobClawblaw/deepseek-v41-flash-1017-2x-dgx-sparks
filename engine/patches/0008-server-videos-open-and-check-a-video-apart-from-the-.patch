@@ -1,0 +1,131 @@
+From d349f9fb4df9150d8d16098f443b265862b45433 Mon Sep 17 00:00:00 2001
+From: BobClawblaw <BobClawblaw@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 02:48:11 +0000
+Subject: [PATCH 8/9] server/videos: open and check a video apart from the
+ family's prepare, so DeepSeek-V4.1 reuses main's limits and libtfvideo
+ message
+
+---
+ zig/src/server/videos.zig | 70 ++++++++++++++++++++++-----------------
+ 1 file changed, 39 insertions(+), 31 deletions(-)
+
+diff --git a/zig/src/server/videos.zig b/zig/src/server/videos.zig
+index 9679475a..4569895b 100644
+--- a/zig/src/server/videos.zig
++++ b/zig/src/server/videos.zig
+@@ -22,7 +22,7 @@ pub const Budget = struct {
+ };
+ 
+ /// A video part's bytes: a data URL's, or with --vision-urls (`fetch`) a public HTTPS URL's.
+-fn bytesOf(cx: *Cx, fetch: ?images.Fetch, url: []const u8, b: *Budget) errors.Refused![]const u8 {
++pub fn bytesOf(cx: *Cx, fetch: ?images.Fetch, url: []const u8, b: *Budget) errors.Refused![]const u8 {
+     const limit = @min(max_bytes, max_total_bytes - b.used);
+     if (limit == 0) return cx.refuse("video request exceeds the total byte or time limit");
+     const bytes = if (std.ascii.startsWithIgnoreCase(url, "data:"))
+@@ -53,7 +53,7 @@ fn bytesOf(cx: *Cx, fetch: ?images.Fetch, url: []const u8, b: *Budget) errors.Re
+ }
+ 
+ /// libtfvideo's frames into the engine's sink.
+-const Decoder = struct {
++pub const Decoder = struct {
+     v: api.tfvideo.Video,
+ 
+     const Into = struct {
+@@ -81,7 +81,39 @@ pub fn prepare(
+     b: *Budget,
+ ) errors.Refused!api.PreparedVideo {
+     const bytes = try bytesOf(cx, fetch, url, b);
+-    var d: Decoder = .{ .v = api.tfvideo.Video.open(bytes) catch |e| return switch (e) {
++    var d: Decoder = undefined;
++    const src = try open(cx, bytes, i, &d);
++    defer d.v.close();
++    return offer.prepare(ctx, cx.a, src, max_tokens, offer.max_frames) catch |e| switch (e) {
++        error.OutOfMemory => error.OutOfMemory,
++        error.VideoTooShort => cx.refuse(try std.fmt.allocPrint(
++            cx.a,
++            "video {d} is too short: sampled at 2 frames a second it gives no frame; send at least half a second",
++            .{i + 1},
++        )),
++        error.VideoTooLarge => cx.refuse(try std.fmt.allocPrint(
++            cx.a,
++            "video {d}: the visual-token budget (--vision-video-tokens) is too small for its frames",
++            .{i + 1},
++        )),
++        else => cx.refuse(try invalid(cx, i)),
++    };
++}
++
++/// Video `i`'s (0-based) words for bytes or frames libtfvideo could not decode.
++pub fn invalid(cx: *Cx, i: usize) error{OutOfMemory}![]const u8 {
++    return std.fmt.allocPrint(
++        cx.a,
++        "video {d}: the video's bytes are invalid or unsupported; " ++
++            "use MP4 or WebM (H.264, HEVC, VP8, VP9 or MPEG-4)",
++        .{i + 1},
++    );
++}
++
++/// Video `i`'s (0-based) bytes opened by libtfvideo into `d` and checked against the limits; its frames come
++/// through the returned source until `d.v.close()` (only after a successful open).
++pub fn open(cx: *Cx, bytes: []const u8, i: usize, d: *Decoder) errors.Refused!api.VideoSource {
++    d.* = .{ .v = api.tfvideo.Video.open(bytes) catch |e| return switch (e) {
+         error.NoLibrary => cx.fail(
+             .server,
+             "video input needs libtfvideo (FFmpeg) beside the server: " ++
+@@ -90,14 +122,9 @@ pub fn prepare(
+         ),
+         error.NoStream => cx.refuse(try std.fmt.allocPrint(cx.a, "video {d}: the video has no video stream", .{i + 1})),
+         error.OutOfMemory => error.OutOfMemory,
+-        else => cx.refuse(try std.fmt.allocPrint(
+-            cx.a,
+-            "video {d}: the video's bytes are invalid or unsupported; " ++
+-                "use MP4 or WebM (H.264, HEVC, VP8, VP9 or MPEG-4)",
+-            .{i + 1},
+-        )),
++        else => cx.refuse(try invalid(cx, i)),
+     } };
+-    defer d.v.close();
++    errdefer d.v.close();
+     const info = d.v.info;
+     if (info.width <= 0 or info.height <= 0 or info.width > max_side or info.height > max_side)
+         return cx.refuse(try std.fmt.allocPrint(
+@@ -118,34 +145,15 @@ pub fn prepare(
+         "video {d}: videos are limited to {d} minutes",
+         .{ i + 1, max_seconds / 60 },
+     ));
+-    const src: api.VideoSource = .{
++    return .{
+         .frames = @intCast(info.frames),
+         .rate_num = @intCast(info.rate_num),
+         .rate_den = @intCast(info.rate_den),
+         .width = @intCast(info.width),
+         .height = @intCast(info.height),
+-        .ctx = &d,
++        .ctx = d,
+         .decode = Decoder.decode,
+     };
+-    return offer.prepare(ctx, cx.a, src, max_tokens, offer.max_frames) catch |e| switch (e) {
+-        error.OutOfMemory => error.OutOfMemory,
+-        error.VideoTooShort => cx.refuse(try std.fmt.allocPrint(
+-            cx.a,
+-            "video {d} is too short: sampled at 2 frames a second it gives no frame; send at least half a second",
+-            .{i + 1},
+-        )),
+-        error.VideoTooLarge => cx.refuse(try std.fmt.allocPrint(
+-            cx.a,
+-            "video {d}: the visual-token budget (--vision-video-tokens) is too small for its frames",
+-            .{i + 1},
+-        )),
+-        else => cx.refuse(try std.fmt.allocPrint(
+-            cx.a,
+-            "video {d}: the video's bytes are invalid or unsupported; " ++
+-                "use MP4 or WebM (H.264, HEVC, VP8, VP9 or MPEG-4)",
+-            .{i + 1},
+-        )),
+-    };
+ }
+ 
+ test "video bytes: data URLs within the limits; URLs only with --vision-urls" {
+-- 
+2.43.0
+

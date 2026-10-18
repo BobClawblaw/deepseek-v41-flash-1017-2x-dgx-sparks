@@ -1,0 +1,307 @@
+From 810091fe348bb59fa875d64ee692d79a2b963ce1 Mon Sep 17 00:00:00 2001
+From: BobClawblaw <BobClawblaw@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 02:48:11 +0000
+Subject: [PATCH 6/9] deepseek_v41 vision: decoded RGB into the image path
+ (host.prepareRgb), video frames sampled at most 2 a second
+ (TF_DSV41_VIDEO_MAX_FRAMES)
+
+---
+ zig/src/families/deepseek_v41/vision/host.zig |  50 ++++--
+ zig/src/families/deepseek_v41/vision/prep.zig |   4 +
+ zig/src/families/deepseek_v41/vision/root.zig |   1 +
+ .../families/deepseek_v41/vision/video.zig    | 167 ++++++++++++++++++
+ 4 files changed, 211 insertions(+), 11 deletions(-)
+ create mode 100644 zig/src/families/deepseek_v41/vision/video.zig
+
+diff --git a/zig/src/families/deepseek_v41/vision/host.zig b/zig/src/families/deepseek_v41/vision/host.zig
+index 8b138568..5179c478 100644
+--- a/zig/src/families/deepseek_v41/vision/host.zig
++++ b/zig/src/families/deepseek_v41/vision/host.zig
+@@ -7,6 +7,7 @@ const vids_mod = @import("vids.zig");
+ const parts = @import("parts.zig");
+ const decode = @import("decode.zig");
+ const fetch_mod = @import("fetch.zig");
++const pixels = @import("pixels.zig");
+ const Allocator = std.mem.Allocator;
+ 
+ /// One prepared image, shared by the cache and the requests that hold it.
+@@ -92,6 +93,19 @@ pub const Host = struct {
+             error.Undecodable => refuse(problem, try std.fmt.allocPrint(a, "could not decode the image ({s})", .{if (which.len > 0) which else "unknown format"})),
+         };
+         defer rgb.deinit(h.gpa);
++        return h.finish(a, rgb, key, problem);
++    }
++
++    /// Decoded RGB (a video's frame) through the image path from preparation on: the same resampling, token budget,
++    /// virtual ids and hold as an image's, not cached. ``rgb`` stays the caller's.
++    pub fn prepareRgb(h: *Host, a: Allocator, rgb: pixels.Rgb, problem: *parts.Problem) error{ Refused, OutOfMemory }!*Shared {
++        if (rgb.w == 0 or rgb.h == 0 or rgb.data.len != @as(usize, rgb.w) * rgb.h * 3) return refuse(problem, "a video frame's pixels are malformed");
++        if (@as(u64, rgb.w) * rgb.h > h.s.max_pixels) return refuse(problem, try std.fmt.allocPrint(a, "video frame of more than {d} pixels (TF_DSV41_VISION_MAX_PIXELS)", .{h.s.max_pixels}));
++        return h.finish(a, rgb, null, problem);
++    }
++
++    /// RGB pixels -> a prepared, held image (cached under ``key`` when given).
++    fn finish(h: *Host, a: Allocator, rgb: pixels.Rgb, key: ?[32]u8, problem: *parts.Problem) error{ Refused, OutOfMemory }!*Shared {
+         var p = prep.preprocess(h.gpa, rgb, &h.s) catch |e| return switch (e) {
+             error.OutOfMemory => error.OutOfMemory,
+             error.NoGrid => refuse(problem, try std.fmt.allocPrint(a, "image of {d}x{d}: no grid fits {d} positions", .{ rgb.w, rgb.h, h.s.budget() })),
+@@ -135,7 +149,22 @@ pub const Host = struct {
+     pub fn images(h: *Host, a: Allocator, urls: []const []const u8, problem: *parts.Problem) error{ Refused, OutOfMemory }![]*Shared {
+         if (urls.len == 0) return &.{};
+         if (urls.len > h.s.max_images) return refuse(problem, try std.fmt.allocPrint(a, "{d} images in one request: at most {d} (TF_DSV41_VISION_MAX_IMAGES)", .{ urls.len, h.s.max_images }));
+-        // ``self.slots.acquire(timeout=60)``: a slot within 60 s, else busy (HTTP 503)
++        try h.enter(problem);
++        defer h.leave();
++        const until = h.deadline();
++        const out = try a.alloc(*Shared, urls.len);
++        var n: usize = 0;
++        errdefer for (out[0..n]) |e| h.release(e);
++        for (urls) |u| {
++            out[n] = try h.prepare(a, u, until, problem);
++            n += 1;
++        }
++        return out;
++    }
++
++    /// One of TF_DSV41_VISION_PREP_SLOTS preparing slots (``leave`` it): ``self.slots.acquire(timeout=60)``, a slot
++    /// within 60 s, else busy (HTTP 503).
++    pub fn enter(h: *Host, problem: *parts.Problem) error{Refused}!void {
+         const give_up = std.Io.Clock.awake.now(h.io).nanoseconds + 60 * std.time.ns_per_s;
+         while (true) {
+             const cur = h.preparing.load(.acquire);
+@@ -149,16 +178,15 @@ pub const Host = struct {
+             }
+             std.Io.sleep(h.io, .fromMilliseconds(5), .awake) catch {};
+         }
+-        defer _ = h.preparing.fetchSub(1, .acq_rel);
+-        const deadline = std.Io.Clock.awake.now(h.io).nanoseconds + @as(i96, @intFromFloat(h.s.fetch_total_s * 1e9));
+-        const out = try a.alloc(*Shared, urls.len);
+-        var n: usize = 0;
+-        errdefer for (out[0..n]) |e| h.release(e);
+-        for (urls) |u| {
+-            out[n] = try h.prepare(a, u, deadline, problem);
+-            n += 1;
+-        }
+-        return out;
++    }
++
++    pub fn leave(h: *Host) void {
++        _ = h.preparing.fetchSub(1, .acq_rel);
++    }
++
++    /// A request's image downloads' deadline (TF_DSV41_VISION_FETCH_TOTAL_S from now).
++    pub fn deadline(h: *Host) i96 {
++        return std.Io.Clock.awake.now(h.io).nanoseconds + @as(i96, @intFromFloat(h.s.fetch_total_s * 1e9));
+     }
+ 
+     pub fn releaseAll(h: *Host, held: []const *Shared) void {
+diff --git a/zig/src/families/deepseek_v41/vision/prep.zig b/zig/src/families/deepseek_v41/vision/prep.zig
+index f7b60642..ba40dc57 100644
+--- a/zig/src/families/deepseek_v41/vision/prep.zig
++++ b/zig/src/families/deepseek_v41/vision/prep.zig
+@@ -37,6 +37,8 @@ pub const Settings = struct {
+     fetch_private: bool = false,
+     prep_slots: u32 = 8,
+     prep_mb: u64 = 256,
++    /// a video's frames at most (TF_DSV41_VIDEO_MAX_FRAMES; each frame also counts as an image)
++    video_max_frames: u32 = 8,
+ 
+     /// ``Settings.read``: ``config`` is config.json's text (null: the defaults), ``env`` the process environment.
+     pub fn read(arena: Allocator, config: ?[]const u8, env: ?*const std.process.Environ.Map, problem: *[]const u8) Error!Settings {
+@@ -72,6 +74,8 @@ pub const Settings = struct {
+         s.fetch_private = try envFlag(m, "TF_DSV41_VISION_FETCH_PRIVATE", false, problem);
+         s.prep_slots = try envInt(m, "TF_DSV41_VISION_PREP_SLOTS", s.prep_slots, problem);
+         s.prep_mb = try envInt(m, "TF_DSV41_VISION_PREP_MB", s.prep_mb, problem);
++        s.video_max_frames = try envInt(m, "TF_DSV41_VIDEO_MAX_FRAMES", s.video_max_frames, problem);
++        if (s.video_max_frames < 1) return bad(problem, "TF_DSV41_VIDEO_MAX_FRAMES: at least 1");
+         if (s.max_images < 1 or s.prep_slots < 1) return bad(problem, "TF_DSV41_VISION_MAX_IMAGES >= 1, _MAX_TOKENS >= 0, _PREP_SLOTS >= 1");
+         if (s.cap_tokens != 0 and s.cap_tokens < 5) return bad(problem, "TF_DSV41_VISION_MAX_TOKENS: at least 5 (one row of one cell)");
+         return s;
+diff --git a/zig/src/families/deepseek_v41/vision/root.zig b/zig/src/families/deepseek_v41/vision/root.zig
+index a07b1065..001d5c21 100644
+--- a/zig/src/families/deepseek_v41/vision/root.zig
++++ b/zig/src/families/deepseek_v41/vision/root.zig
+@@ -17,6 +17,7 @@ pub const host = @import("host.zig");
+ pub const fetch = @import("fetch.zig");
+ pub const mode = @import("mode.zig");
+ pub const held = @import("held.zig");
++pub const video = @import("video.zig");
+ 
+ test {
+     @import("std").testing.refAllDecls(@This());
+diff --git a/zig/src/families/deepseek_v41/vision/video.zig b/zig/src/families/deepseek_v41/vision/video.zig
+new file mode 100644
+index 00000000..242833fc
+--- /dev/null
++++ b/zig/src/families/deepseek_v41/vision/video.zig
+@@ -0,0 +1,167 @@
++//! Video input for an image model (TF_DSV41_IMAGES=native): a video part is served as frames sampled evenly at
++//! most 2 a second, at most TF_DSV41_VIDEO_MAX_FRAMES of them and within the request's image count
++//! (TF_DSV41_VISION_MAX_IMAGES: a frame counts as an image). Each decoded RGB frame goes through the image path from
++//! preparation on (``host.prepareRgb``: resampling, the per-image token budget, virtual ids, the hold), never
++//! re-encoded. The decoder is the server's (libtfvideo); this file sees frames through ``Source``.
++const std = @import("std");
++const host_mod = @import("host.zig");
++const parts = @import("parts.zig");
++const pixels = @import("pixels.zig");
++const Allocator = std.mem.Allocator;
++
++/// Frames sampled a second, at most.
++pub const max_fps = 2;
++
++/// Where a decoded frame goes: RGB rows of ``width`` * 3 bytes, ``stride`` bytes apart (``api.FrameSink``'s shape).
++pub const Sink = struct {
++    ctx: *anyopaque,
++    take: *const fn (ctx: *anyopaque, k: usize, rgb: []const u8, width: u32, height: u32, stride: usize) anyerror!void,
++};
++
++/// A video's facts and its frames on request (the server's decoder, or a test's fake).
++pub const Source = struct {
++    frames: u64, // the stream's frame count
++    rate_num: u64, // its average frame rate, num / den
++    rate_den: u64,
++    ctx: *anyopaque,
++    /// The frames at ``indices`` (ascending, distinct), each to ``sink`` in order.
++    decode: *const fn (ctx: *anyopaque, indices: []const u32, sink: Sink) anyerror!void,
++};
++
++/// The frames to decode and each one's time in seconds.
++pub const Plan = struct { indices: []u32, times: []f64 };
++
++/// ``frames`` at ``rate_num / rate_den`` sampled evenly: floor(duration x 2) frames (one for a clip under half a
++/// second), at most ``cap`` and at most every frame; each frame the middle of its equal share of the clip.
++pub fn plan(a: Allocator, frames: u64, rate_num: u64, rate_den: u64, cap: u32) error{ NoFrames, OutOfMemory }!Plan {
++    if (frames == 0 or rate_num == 0 or rate_den == 0 or cap == 0) return error.NoFrames;
++    // floor(frames / fps x 2) in integers: frames x den x 2 / num
++    const by_rate: u128 = @as(u128, frames) * rate_den * max_fps / rate_num;
++    const n: usize = @intCast(@max(1, @min(by_rate, @min(@as(u128, cap), frames))));
++    const indices = try a.alloc(u32, n);
++    const times = try a.alloc(f64, n);
++    for (indices, times, 0..) |*idx, *t, k| {
++        const at: u64 = @intCast((@as(u128, 2 * k + 1) * frames) / (2 * n));
++        idx.* = @intCast(@min(at, std.math.maxInt(u32)));
++        t.* = @as(f64, @floatFromInt(idx.*)) * @as(f64, @floatFromInt(rate_den)) / @as(f64, @floatFromInt(rate_num));
++    }
++    return .{ .indices = indices, .times = times };
++}
++
++/// A video's frames prepared as images, held for the request (``host.releaseAll``), and their times.
++pub const Frames = struct { shared: []*host_mod.Shared, times: []f64 };
++
++pub const Error = error{ Refused, OutOfMemory, NoFrames, Undecodable };
++
++/// ``src`` sampled (at most ``cap`` frames) and each frame prepared through ``h`` as an image. ``Refused``: the
++/// frame's preparation refused it (``problem`` says why); ``Undecodable``: the decoder failed.
++pub fn prepare(h: *host_mod.Host, a: Allocator, src: Source, cap: u32, problem: *parts.Problem) Error!Frames {
++    const p = try plan(a, src.frames, src.rate_num, src.rate_den, cap);
++    var c: Collect = .{ .h = h, .a = a, .problem = problem, .out = try a.alloc(*host_mod.Shared, p.indices.len) };
++    errdefer h.releaseAll(c.out[0..c.got]);
++    src.decode(src.ctx, p.indices, .{ .ctx = &c, .take = Collect.take }) catch |e| return switch (e) {
++        error.OutOfMemory => error.OutOfMemory,
++        error.Refused => if (c.refused) error.Refused else error.Undecodable,
++        else => error.Undecodable,
++    };
++    if (c.got != p.indices.len) return error.Undecodable;
++    return .{ .shared = c.out, .times = p.times };
++}
++
++/// Decoded frames into prepared images, in order.
++const Collect = struct {
++    h: *host_mod.Host,
++    a: Allocator,
++    problem: *parts.Problem,
++    out: []*host_mod.Shared,
++    got: usize = 0,
++    refused: bool = false,
++
++    fn take(ctx: *anyopaque, k: usize, rgb: []const u8, w: u32, hgt: u32, stride: usize) anyerror!void {
++        const c: *Collect = @ptrCast(@alignCast(ctx));
++        const row = @as(usize, w) * 3;
++        if (k != c.got or k >= c.out.len or w == 0 or hgt == 0 or stride < row or rgb.len < stride * (hgt - 1) + row) return error.BadFrame;
++        // the rows packed (libtfvideo pads them): the same pixels, not re-encoded
++        const data = try c.h.gpa.alloc(u8, row * hgt);
++        defer c.h.gpa.free(data);
++        for (0..hgt) |y| @memcpy(data[y * row ..][0..row], rgb[y * stride ..][0..row]);
++        c.out[c.got] = c.h.prepareRgb(c.a, .{ .w = w, .h = hgt, .data = data }, c.problem) catch |e| {
++            if (e == error.Refused) c.refused = true;
++            return e;
++        };
++        c.got += 1;
++    }
++};
++
++test "frames sampled evenly at most 2 a second, capped, each the middle of its share" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    // 10 s at 30 fps: 20 by rate, capped at 8 -> 300 / 8 = 37.5 frames a share, the middles
++    const p = try plan(a, 300, 30, 1, 8);
++    try std.testing.expectEqualSlices(u32, &.{ 18, 56, 93, 131, 168, 206, 243, 281 }, p.indices);
++    try std.testing.expectApproxEqAbs(@as(f64, 0.6), p.times[0], 1e-9);
++    try std.testing.expectApproxEqAbs(@as(f64, 281.0 / 30.0), p.times[7], 1e-9);
++    // 3 s at 25 fps: 6 frames (2 a second) under a cap of 8, about half a second apart
++    const q = try plan(a, 75, 25, 1, 8);
++    try std.testing.expectEqualSlices(u32, &.{ 6, 18, 31, 43, 56, 68 }, q.indices);
++    try std.testing.expectApproxEqAbs(@as(f64, 0.72), q.times[1], 1e-9);
++    // NTSC: 2.5 s at 30000/1001 -> 5 frames
++    try std.testing.expectEqual(@as(usize, 5), (try plan(a, 75, 30000, 1001, 8)).indices.len);
++    // a clip under half a second still gives its middle frame
++    const one = try plan(a, 3, 30, 1, 8);
++    try std.testing.expectEqualSlices(u32, &.{1}, one.indices);
++    // a slow stream: never more frames than it has, all distinct
++    const slow = try plan(a, 4, 1, 1, 8);
++    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, slow.indices);
++    // the cap the request's image count leaves
++    try std.testing.expectEqual(@as(usize, 3), (try plan(a, 300, 30, 1, 3)).indices.len);
++    try std.testing.expectError(error.NoFrames, plan(a, 0, 30, 1, 8));
++    try std.testing.expectError(error.NoFrames, plan(a, 30, 30, 1, 0));
++}
++
++/// A fake decoder: ``frames`` solid frames of ``w`` x ``h``, rows padded to ``stride``; records what was asked.
++const Fake = struct {
++    w: u32,
++    h: u32,
++    stride: usize,
++    asked: []const u32 = &.{},
++
++    fn decode(ctx: *anyopaque, indices: []const u32, sink: Sink) anyerror!void {
++        const f: *Fake = @ptrCast(@alignCast(ctx));
++        f.asked = indices;
++        var buf: [64 * 64 * 4]u8 = undefined;
++        for (indices, 0..) |idx, k| {
++            @memset(buf[0 .. f.stride * f.h], @truncate(idx * 7));
++            try sink.take(sink.ctx, k, buf[0 .. f.stride * f.h], f.w, f.h, f.stride);
++        }
++    }
++};
++
++test "a fake video's frames through the image path: one prepared image a frame, padded rows packed" {
++    const gpa = std.testing.allocator;
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    var h = host_mod.Host.init(gpa, std.testing.io, .{});
++    defer h.deinit();
++    var fake: Fake = .{ .w = 8, .h = 6, .stride = 32 };
++    var problem: parts.Problem = .{};
++    const src: Source = .{ .frames = 60, .rate_num = 30, .rate_den = 1, .ctx = &fake, .decode = Fake.decode };
++    const got = try prepare(&h, arena.allocator(), src, 3, &problem);
++    defer h.releaseAll(got.shared);
++    try std.testing.expectEqual(@as(usize, 3), got.shared.len);
++    try std.testing.expectEqualSlices(u32, &.{ 10, 30, 50 }, fake.asked);
++    for (got.shared) |s| {
++        try std.testing.expectEqual(@as(u32, 12), s.p.llm_h); // as an 8 x 6 image (vision's own test of it)
++        try std.testing.expectEqual(@as(usize, s.p.tokens()), s.p.vids.len);
++    }
++    try std.testing.expect(!std.mem.eql(u8, &got.shared[0].p.digest, &got.shared[1].p.digest)); // different frames
++    // a frame over the pixel limit is the frame's refusal, not the decoder's
++    var small = host_mod.Host.init(gpa, std.testing.io, .{ .max_pixels = 16 });
++    defer small.deinit();
++    try std.testing.expectError(error.Refused, prepare(&small, arena.allocator(), src, 3, &problem));
++    try std.testing.expectEqualStrings("video frame of more than 16 pixels (TF_DSV41_VISION_MAX_PIXELS)", problem.message);
++    // a malformed frame is the decoder's
++    var bad: Fake = .{ .w = 8, .h = 6, .stride = 4 };
++    try std.testing.expectError(error.Undecodable, prepare(&h, arena.allocator(), .{ .frames = 60, .rate_num = 30, .rate_den = 1, .ctx = &bad, .decode = Fake.decode }, 3, &problem));
++}
+-- 
+2.43.0
+

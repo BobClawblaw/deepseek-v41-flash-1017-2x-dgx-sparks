@@ -1,94 +1,128 @@
-# DeepSeek-V4.1-Flash-1017 on two DGX Sparks
+# DeepSeek-V4.1-Flash-1017 on two DGX Sparks, native TensorFold
 
-[deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) (MIT), served at
-TP=2 on two NVIDIA DGX Sparks (GB10, 128 GB each) over their CX7 link, behind an OpenAI-compatible API.
+[deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) (MIT) on the
+native TensorFold engine (Zig and CUDA, built from TensorFold's main branch). It runs at TP=2 on two NVIDIA DGX Sparks
+(GB10, 128 GB each) over their CX7 link, with text, **images** (the model's vision tower) and **video** (sampled frames).
+It serves an OpenAI-compatible API.
 
-This is a thin recipe on top of [jayleaton/deepseek-v41-tensorfold-spark](https://github.com/jayleaton/deepseek-v41-tensorfold-spark)
-(Apache-2.0). That recipe serves the earlier V4.1-Flash on TensorFold 0.6.0 with its own patches. It is included
-unmodified as the submodule `vendor/deepseek-v41-tensorfold-spark`. This repository adds what the 1017 release
-needs, and one fix for GB10:
+## What this is
 
-- **The 1017 pack.** [LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw)
-  is EXL3 at 2.9 bpw, 196 GiB. Its tensors match Mia-AiLab's V4.1 pack, which the recipe loads. The 1017 release
-  has the same architecture as V4.1-Flash, with new weights.
-- **The 1017 Engram tables**, from shards 47 and 48 of the base repo, which changed in this release. They are packed
-  per rank with the recipe's `pack_engram.py`.
-- **The 1017 image routing bias**, fetched from the 1017 repo. The recipe would otherwise fetch the older release's.
-- **A chat template.** The 1017 pack ships none, and the server stops without one. DeepSeek's `encoding/encoding.py`
-  is byte-identical in the two releases, so the template of Mia-AiLab's pack applies unchanged.
-- **`patches/0001-serve-nccl-cumem-off.patch`** sets `NCCL_CUMEM_HOST_ENABLE=0` and `NCCL_CUMEM_ENABLE=0` in both
-  ranks' containers. On GB10, the first boot left the worker's driver with `NV_ERR_NO_MEMORY` from
-  `_memdescAllocInternal`, and every later NCCL start then failed with "unhandled system error" until a reboot.
-  With the settings off, starts come up clean. The same fix holds for GLM-5.3-Flash on the same pair.
+TensorFold's main branch has no DeepSeek-V4.1 family yet. This recipe builds one from public work and adds what the
+1017 release and video need:
+
+- **The engine** (`engine/engine.sh`) assembles its source from four parts:
+  1. TensorFold main at `9ccf4727`.
+  2. jayleaton's DeepSeek-V4.1 series ([ashhart/TensorFold #727](https://github.com/ashhart/TensorFold/pull/727) and the
+     PRs it stacks on), merged.
+  3. The series' newer engine with the vision tower. This is the "kit", engine `9131e10a`, from
+     [jayleaton/deepseek-v41-tensorfold-spark](https://github.com/jayleaton/deepseek-v41-tensorfold-spark), the submodule.
+     The script overlays the files that `engine/kit-overlay.txt` lists.
+  4. This repository's patches (`engine/patches/`):
+     - the kit on main's runtime, lane host and server;
+     - native images on main's server;
+     - the 1017 pack's fp16 tensors;
+     - video.
+- **The 1017 pack** is [LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw):
+  EXL3 at 2.9 bpw, 196 GiB, in Mia-AiLab's layout. Two of its tensors are stored as fp16 where the engine expected
+  fp32: the router bias and DSpark's confidence head. The patches widen them exactly at load.
+- **The 1017 Engram tables**, from shards 47 and 48 of the base repo. They changed in this release. Each rank keeps its
+  half on its own NVMe.
+- **The 1017 image routing bias**, fetched from the 1017 repo.
+- **A chat template.** The pack ships none. DeepSeek's `encoding/encoding.py` is byte-identical in the 1017 and the
+  earlier release, so Mia-AiLab's template applies.
+- **Video.** DeepSeek-V4.1 has no video input of its own. A `video_url` part is decoded by TensorFold's `libtfvideo`
+  (FFmpeg) and sampled evenly at up to 2 frames a second, up to `TF_DSV41_VIDEO_MAX_FRAMES` (8). Each frame goes in as
+  an image, after a "*t* seconds" line.
 
 ## Measured
 
-Recipe harness ([recipe-harness](https://github.com/BobClawblaw/recipe-harness), target `harness/dsv41-1017-gb10.toml`,
-plan `harness/dsv41-speed.toml`) on two DGX Sparks, recipe defaults (4 slots, DSpark drafts, replay prefill).
-Aggregate tok/s for prose / code / structured / list, then first-text latency:
+Recipe harness ([recipe-harness](https://github.com/BobClawblaw/recipe-harness)), target
+`harness/dsv41-1017-gb10-native-vision.toml`, plan `harness/dsv41-speed.toml`, on two DGX Sparks. Settings: 4 slots,
+DSpark drafts, native images. Aggregate tok/s for prose / code / structured / list, then first-text latency:
 
 | Streams | tok/s | First text |
 |---|---|---|
-| 1 | 54.7 / 100.6 / 62.6 / 71.3 | 0.19-0.26 s |
-| 2 | 77.4 / 126.5 / 84.0 / 142.6 | 0.30-0.39 s |
-| 4 | 103.5 / 155.8 / 109.0 / 173.2 | 0.41-0.64 s |
+| 1 | 55.2 / 100.4 / 62.5 / 71.4 | 0.19-0.26 s |
+| 2 | 81.0 / 124.9 / 84.2 / 143.6 | 0.31-0.40 s |
+| 4 | 106.5 / 161.6 / 111.9 / 178.7 | 0.73-0.99 s |
 
-- **Memory:** about 8 GiB available on the head and 10 GiB on the worker while serving, with 4 slots at a
-  300,000-token window.
-- **Leaderboard:** the TensorFold community benchmark (attached, so unranked) measured chat at 63.6 tok/s (T=1) and
-  63.7 tok/s (T=0), first text 0.20 s. Its `code` workload sends a bare prompt to `/v1/completions`, and DeepSeek-V4.1's
-  greedy first token there is end-of-sequence, so `code` is not measured.
-- **Quality:** see [Quality](#quality).
+The same build without the vision tower (the series alone) measured 98.1 / 158.5 tok/s on code at 1 / 4 streams.
+
+Checks run on the served model:
+- 17 x 23 = 391.
+- DeepSeek's own example image is described correctly ("five fresh, bright orange carrots with green stems").
+- A 4-second clip of four solid colours came through as 8 frames at 0.2 to 3.9 seconds. Every colour was named at
+  its time.
+
+Quality: see [Quality](#quality).
 
 ## Requirements
 
-As the recipe's [docs/INSTALL.md](https://github.com/jayleaton/deepseek-v41-tensorfold-spark/blob/main/docs/INSTALL.md):
-two DGX Sparks with their CX7 ports cabled and addressed, Docker with the NVIDIA runtime, and passwordless ssh from
-the head to the worker over the link.
+- **Hardware:** two DGX Sparks with their CX7 ports cabled and addressed, Docker with the NVIDIA runtime and RDMA
+  devices, and passwordless ssh from the head to the worker over the link.
+- **Each node's NVMe:**
 
-- **Each node's NVMe:** about 211 GB for the pack, 95 GB for its Engram half, about 105 GB for the prepared folders
-  (written on first start), and the session tier (128 GiB by default).
-- **The head, while staging:** 190 GB more for the base Engram shards; they can be deleted after packing.
-- **The GPUs:** nothing else on them.
+  | What | Size |
+  |---|---|
+  | Pack | ~211 GB |
+  | Engram half | ~95 GB |
+  | Prepared weights (written on the first start) | ~100 GB |
+  | Assets | ~1 GB |
+  | Session tier | 128 GiB |
+
+  The head needs ~190 GB more while staging, for the base Engram shards.
+- **Nothing else on the GPUs.**
 
 ## Run
 
 ```bash
 git clone --recurse-submodules https://github.com/BobClawblaw/deepseek-v41-flash-1017-2x-dgx-sparks.git
 cd deepseek-v41-flash-1017-2x-dgx-sparks
-scripts/stage.sh setup        # applies the patch, writes vendor/.../config/prod.env from config/prod.env.example
-$EDITOR vendor/deepseek-v41-tensorfold-spark/config/prod.env   # WORKER_SSH, HEAD_IP, paths, NIC / HCA names
-scripts/stage.sh weights      # pack + chat template, then onto the worker (~211 GB)
-scripts/stage.sh engram       # 1017 Engram shards (~190 GB), each rank's half, rank 1's onto the worker
-scripts/stage.sh build        # the recipe's image on both nodes
-scripts/stage.sh bias         # the 1017 image routing bias into both nodes' cache volume
-cd vendor/deepseek-v41-tensorfold-spark
-scripts/serve.sh prebuild && scripts/serve.sh preflight && scripts/serve.sh start   # GPUs idle on both nodes
+scripts/stage.sh setup      # writes config/native.env: fill in every <placeholder>
+scripts/stage.sh all        # weights, Engram, engine image, asset tools image, assets, cache (hours, mostly downloads)
+scripts/stage.sh start      # rank 1 on the worker, rank 0 here
 ```
 
-The first start writes the prepared folders (about 6 minutes); later starts take about a minute. Check the answer to a
-known question before you trust the server:
+- **When it's ready:** rank 0's log (`/tmp/dsv41-r0.log`) prints `serving DeepSeek-V4.1-Flash-TF at
+  http://localhost:8000/v1`. That takes about 8 minutes on a first start, while it writes the prepared weights, and
+  about 2 minutes after that.
+- **Stopping:** `scripts/stage.sh stop` lets rank 0 drain, then rank 1 follows.
+
+Then:
 
 ```bash
 curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{"model": "DeepSeek-V4.1-Flash-TF",
   "messages": [{"role": "user", "content": "What is 17 * 23?"}], "temperature": 0, "reasoning_effort": "low"}'
 ```
 
-`scripts/serve.sh status | logs [0|1] | stop | restart` as in the recipe. Thinking is on by default (effort 75);
-`"chat_template_kwargs": {"enable_thinking": false}` turns it off for a request.
+Images and video are OpenAI content parts: `{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}`
+and `{"type": "video_url", "video_url": {"url": "data:video/mp4;base64,..."}}`. They also accept public `https://`
+URLs. Thinking is on by default; `"chat_template_kwargs": {"enable_thinking": false}` turns it off for a request.
 
 ## Quality
 
-Pending: the harness's quality plan (`harness/dsv41-quality.toml`) runs with thinking off and on. The results go here.
+Pending. The harness quality plan (`harness/dsv41-quality.toml`, thinking off and on) is run on this build, and the
+results go here.
 
 ## Known issues
 
-- **The recipe's own list** ([docs/KNOWN-ISSUES.md](https://github.com/jayleaton/deepseek-v41-tensorfold-spark/blob/main/docs/KNOWN-ISSUES.md))
-  applies. In particular, prefill is the recipe's approximate `replay` by default; `TF_DSV41_PREFILL=full` is exact
-  and slower.
-- **Memory headroom is small by design.** The recipe plans for a 4-5 GiB floor per node.
-- **The 1017 pack is new.** It was published the day this recipe was made, so it has had less use than the V4.1 packs.
+- **A small KV pool.** With the vision tower loaded, the engine's boot gate passed a shared pool of only
+  `TF_DSV41_POOL_TOKENS=200000` positions on this pack, across the 4 slots. Without images it was 900K. Long prompts
+  run in 2,048-row prefill segments at the tightest point. The gate prints the largest pool that fits when it refuses
+  one.
+- **The worker's driver after a failed start.** On our pair, every start that failed (a memory-gate refusal, a missing
+  kernel variant) left the worker's NVIDIA driver logging `NV_ERR_NO_MEMORY`. The next start then failed in NCCL's
+  memory registration (`ibv_reg_mr ... Cannot allocate memory`) until the worker was rebooted. Reboot it before
+  retrying a failed start.
+- **Missing kernel variants.** Changing a serving setting can need Triton variants the AOT set lacks. A start then
+  stops with `MissingTritonVariant`. `scripts/stage.sh assets` enumerates and compiles the set again; variants already
+  compiled are kept.
+- **Structured output** in this engine also needs `libtfgrammar.so` beside the server (TensorFold's
+  `zig build grammar -Dxgrammar=...`). Without it, requests with a response format are refused.
+- **The Dockerfile route.** The served build was made with the same sources and steps, but outside Docker.
+  `docker/Dockerfile` has not been run end to end yet. Report what breaks.
 
 ## License
 
-Apache-2.0 (see LICENSE and NOTICE). The model weights keep their own licenses (MIT for DeepSeek's release).
+Apache-2.0 (see LICENSE and NOTICE). The model weights keep their own licenses: MIT for DeepSeek's release, MIT for
+the EXL3 packs.

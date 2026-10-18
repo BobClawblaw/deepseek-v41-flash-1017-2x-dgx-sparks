@@ -1,0 +1,358 @@
+From cb21b315b5641c72b2ae9f1c810760bea06c3d24 Mon Sep 17 00:00:00 2001
+From: BobClawblaw <BobClawblaw@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 02:48:11 +0000
+Subject: [PATCH 9/9] server/deepseek: TF_DSV41_IMAGES=native serves video_url
+ parts as timestamped frames through the image path
+
+---
+ zig/src/server/deepseek.zig | 275 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 274 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/server/deepseek.zig b/zig/src/server/deepseek.zig
+index 9f15ad51..0f9fb185 100644
+--- a/zig/src/server/deepseek.zig
++++ b/zig/src/server/deepseek.zig
+@@ -12,6 +12,11 @@
+ //! - **Images** (TF_DSV41_IMAGES): ``placeholder`` (default) renders each image part as TF_DSV41_IMAGE_TEXT, a notice
+ //!   that the model cannot see it; ``reject`` refuses such requests; ``native`` sends them to the vision tower on rank 0
+ //!   (``serve.vision``: each part a sentinel, then ``<｜deepseek_image｜>``, then its span of virtual ids).
++//! - **Videos**: an image model, so a ``video_url`` part is what an image part is under ``placeholder`` / ``reject``;
++//!   under ``native`` it is frames (``vision/video.zig``): decoded by libtfvideo within main's video limits
++//!   (``videos.zig``: 2 videos, 16 MB each, 20 MB in all; https URLs unless TF_DSV41_VISION_FETCH=0), sampled evenly
++//!   at most 2 a second and TF_DSV41_VIDEO_MAX_FRAMES (8), within TF_DSV41_VISION_MAX_IMAGES (a frame counts as an
++//!   image), each frame ``<t> seconds`` then its image span.
+ //! - ``response_format``'s schema joins the system block (``## Response Format``; TF_DSV41_SCHEMA_PROMPT=0: not).
+ //! - Replies' reasoning as ``reasoning_content`` and ``reasoning`` (TF_DSV41_REASONING_FIELDS).
+ const std = @import("std");
+@@ -32,6 +37,9 @@ const deepseek_session = @import("deepseek_session.zig");
+ const Memory = deepseek_session.Memory;
+ const Reply = deepseek_session.Reply;
+ const vision = serve.vision;
++const api = @import("engine_api");
++const videos = @import("videos.zig");
++const images_mod = @import("images.zig");
+ 
+ pub const model_type = "deepseek_v41";
+ 
+@@ -105,6 +113,8 @@ pub const DeepSeek = struct {
+     /// TF_DSV41_IMAGES=native: the image front end (rank 0's prepared-image cache, virtual ids)
+     vision: ?*vision.host.Host = null,
+     io: ?std.Io = null,
++    /// TF_DSV41_IMAGES=native: where video parts' frames come from (libtfvideo; tests: a fake)
++    video_source: VideoSource = libtfvideo,
+ 
+     /// `pa` owns a failure's `problem` text (the caller's problem arena), so a refused load leaks nothing.
+     pub fn load(gpa: Allocator, io: std.Io, dir: []const u8, options: Options, pa: Allocator, problem: *[]const u8) !*DeepSeek {
+@@ -323,12 +333,14 @@ pub const DeepSeek = struct {
+         const a = cx.a;
+         var marker = vision.parts.Marker.init(a, d.io.?);
+         o.image = .{ .ctx = &marker, .text = vision.parts.Marker.hook };
++        o.video = .{ .ctx = &marker, .text = vision.parts.Marker.videoHook };
+         var problem: template.Problem = .{};
+         const prompt = template.render(a, messages, o.*, &problem) catch |e| switch (e) {
+             error.OutOfMemory => return error.OutOfMemory,
+             error.Refused => return cx.refuse(problem.message),
+         };
+         var vp: vision.parts.Problem = .{};
++        for (marker.videos.items) |is_video| if (is_video) return d.renderFrames(cx, vh, &marker, prompt);
+         const sp = marker.splice(prompt, &vp) catch |e| switch (e) {
+             error.OutOfMemory => return error.OutOfMemory,
+             error.Refused => return cx.refuse(vp.message),
+@@ -339,7 +351,104 @@ pub const DeepSeek = struct {
+             error.OutOfMemory => return error.OutOfMemory,
+             error.Refused => return if (vp.busy) cx.fail(.capacity, "{s}", .{vp.message}) else cx.refuse(vp.message),
+         };
+-        const hold = try a.create(Hold);
++        return holdImages(cx, vh, ids, shared);
++    }
++
++    /// A rendered prompt with video parts (and maybe images): each video's frames sampled and prepared as images,
++    /// its sentinel as ``<t> seconds`` and an image placeholder a frame; then the images; one slot for them all.
++    fn renderFrames(d: *DeepSeek, cx: *Cx, vh: *vision.host.Host, marker: *vision.parts.Marker, prompt: []const u8) errors.Refused!family.Rendered {
++        const a = cx.a;
++        var vp: vision.parts.Problem = .{};
++        if (marker.problem) |p| return cx.refuse(p);
++        const n_parts = marker.urls.items.len;
++        var n_videos: usize = 0;
++        for (marker.videos.items) |v| n_videos += @intFromBool(v);
++        const n_images = n_parts - n_videos;
++        if (n_videos > videos.max_videos) return cx.refuse(try std.fmt.allocPrint(a, "a request supports at most {d} videos", .{videos.max_videos}));
++        const max = vh.s.max_images;
++        if (n_parts > max) return cx.refuse(try std.fmt.allocPrint(a, "{d} images and videos in one request: at most {d} (TF_DSV41_VISION_MAX_IMAGES; a video's frames count as images)", .{ n_parts, max }));
++        vh.enter(&vp) catch return cx.fail(.capacity, "{s}", .{vp.message});
++        defer vh.leave();
++        var owned: std.ArrayList(*vision.host.Shared) = .empty; // everything held so far, released on a refusal
++        var handed = false;
++        errdefer if (!handed) vh.releaseAll(owned.items);
++        const texts = try a.alloc(?[]const u8, n_parts);
++        @memset(texts, null);
++        const frames_of = try a.alloc([]const *vision.host.Shared, n_parts);
++        var left: usize = max - n_images; // frames the request's image count leaves, shared evenly by its videos
++        var videos_left = n_videos;
++        var vi: usize = 0;
++        var bytes_left: videos.Budget = .{ .deadline = std.Io.Clock.awake.now(d.io.?).addDuration(.fromSeconds(videos.total_s)) };
++        const fetch: ?images_mod.Fetch = if (vh.s.fetch) images_mod.Fetch.network(d.io.?) else null;
++        for (marker.urls.items, marker.videos.items, 0..) |url, is_video, i| {
++            if (!is_video) continue;
++            const cap: u32 = @intCast(@min(vh.s.video_max_frames, left / videos_left));
++            if (!std.ascii.startsWithIgnoreCase(url, "data:") and std.mem.startsWith(u8, url, "https://") and fetch == null)
++                return cx.refuse("this server does not fetch video URLs (TF_DSV41_VISION_FETCH=0): send a data: URL");
++            const op = try d.video_source.open(d.video_source.ctx, cx, url, vi, &bytes_left, fetch);
++            defer op.close(op.ctx);
++            const fr = vision.video.prepare(vh, a, op.src, cap, &vp) catch |e| return switch (e) {
++                error.OutOfMemory => error.OutOfMemory,
++                error.Refused => cx.refuse(try std.fmt.allocPrint(a, "video {d}: {s}", .{ vi + 1, vp.message })),
++                error.NoFrames => cx.refuse(try std.fmt.allocPrint(a, "video {d}: the video's frame count or rate is missing", .{vi + 1})),
++                error.Undecodable => cx.refuse(try videos.invalid(cx, vi)),
++            };
++            try owned.appendSlice(a, fr.shared);
++            frames_of[i] = fr.shared;
++            texts[i] = try frameText(a, fr.times);
++            left -= fr.shared.len;
++            videos_left -= 1;
++            vi += 1;
++        }
++        const sp = marker.spliceWith(prompt, texts, &vp) catch |e| switch (e) {
++            error.OutOfMemory => return error.OutOfMemory,
++            error.Refused => return cx.refuse(vp.message),
++        };
++        const ids = try d.tok.encodeAlloc(a, sp.text);
++        const until = vh.deadline();
++        var shared: std.ArrayList(*vision.host.Shared) = .empty; // prompt order: an image, or a video's frames
++        for (sp.order) |i| {
++            if (marker.videos.items[i]) {
++                try shared.appendSlice(a, frames_of[i]);
++                continue;
++            }
++            const e = vh.prepare(a, marker.urls.items[i], until, &vp) catch |err| switch (err) {
++                error.OutOfMemory => return error.OutOfMemory,
++                error.Refused => return cx.refuse(vp.message),
++            };
++            owned.append(a, e) catch |err| {
++                vh.release(e);
++                return err;
++            };
++            try shared.append(a, e);
++        }
++        handed = true;
++        return holdImages(cx, vh, ids, shared.items);
++    }
++
++    /// A video's frames in the prompt: ``<t> seconds`` (main's ``videos.seconds``) then the image placeholder, a line
++    /// a frame.
++    pub fn frameText(a: Allocator, times: []const f64) Allocator.Error![]const u8 {
++        var out: std.ArrayList(u8) = .empty;
++        for (times, 0..) |t, k| {
++            if (k > 0) try out.append(a, '\n');
++            var buf: [64]u8 = undefined;
++            try out.appendSlice(a, videos.seconds(&buf, t) catch unreachable); // within videos.max_seconds
++            try out.append(a, '\n');
++            try out.appendSlice(a, vision.parts.IMAGE_PLACEHOLDER);
++        }
++        return out.items;
++    }
++
++    /// The prepared images (prompt order) held for the request (released on a refusal), the prompt's placeholders
++    /// expanded to their virtual ids.
++    fn holdImages(cx: *Cx, vh: *vision.host.Host, ids: []const u32, shared: []const *vision.host.Shared) errors.Refused!family.Rendered {
++        const a = cx.a;
++        var vp: vision.parts.Problem = .{};
++        const hold = a.create(Hold) catch |e| {
++            vh.releaseAll(shared);
++            return e;
++        };
+         hold.* = .{ .vh = vh, .shared = shared };
+         errdefer hold.release();
+         const preps = try a.alloc(vision.prep.Prepared, shared.len);
+@@ -373,6 +482,33 @@ pub const DeepSeek = struct {
+         }
+     };
+ 
++    /// Where a video part's frames come from: an opened video's frames, and how to close it.
++    pub const VideoSource = struct {
++        ctx: ?*anyopaque = null,
++        /// Video ``i``'s (0-based) part at ``url``: its bytes within main's limits (``b``), opened.
++        open: *const fn (ctx: ?*anyopaque, cx: *Cx, url: []const u8, i: usize, b: *videos.Budget, fetch: ?images_mod.Fetch) errors.Refused!Opened,
++    };
++    pub const Opened = struct { src: vision.video.Source, ctx: *anyopaque, close: *const fn (ctx: *anyopaque) void };
++
++    /// main's video path (``videos.zig``): data: or https bytes, libtfvideo, the size / length / rate checks.
++    const libtfvideo: VideoSource = .{ .open = struct {
++        fn open(_: ?*anyopaque, cx: *Cx, url: []const u8, i: usize, b: *videos.Budget, fetch: ?images_mod.Fetch) errors.Refused!Opened {
++            const bytes = try videos.bytesOf(cx, fetch, url, b);
++            const dec = try cx.a.create(videos.Decoder);
++            const src = try cx.a.create(api.VideoSource);
++            src.* = try videos.open(cx, bytes, i, dec);
++            return .{ .src = .{ .frames = src.frames, .rate_num = src.rate_num, .rate_den = src.rate_den, .ctx = src, .decode = decode }, .ctx = dec, .close = close };
++        }
++        fn decode(ctx: *anyopaque, indices: []const u32, sink: vision.video.Sink) anyerror!void {
++            const src: *api.VideoSource = @ptrCast(@alignCast(ctx));
++            return src.decode(src.ctx, indices, .{ .ctx = sink.ctx, .take = sink.take });
++        }
++        fn close(ctx: *anyopaque) void {
++            const dec: *videos.Decoder = @ptrCast(@alignCast(ctx));
++            dec.v.close();
++        }
++    }.open };
++
+     fn openVision(gpa: Allocator, io: std.Io, dir: []const u8, env: ?*const std.process.Environ.Map, pa: Allocator, problem: *[]const u8) !*vision.host.Host {
+         const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
+         defer gpa.free(path);
+@@ -389,6 +525,10 @@ pub const DeepSeek = struct {
+         h.* = vision.host.Host.init(gpa, io, s);
+         try h.enableFetch(); // TF_DSV41_VISION_FETCH (default 1): https image URLs as prod fetches them
+         log.line("images: native (TF_DSV41_IMAGES), at most {d} a request, {d} positions an image; image URLs: {s}", .{ s.max_images, s.budget(), if (s.fetch) "data: and https (public addresses, pinned)" else "data: only (TF_DSV41_VISION_FETCH=0)" });
++        if (api.tfvideo.version()) |v|
++            log.line("videos: as frames, at most {d} a video (TF_DSV41_VIDEO_MAX_FRAMES) at most 2 a second; libtfvideo over FFmpeg {s}", .{ s.video_max_frames, v })
++        else
++            log.line("videos: libtfvideo is not on the loader's path: video parts will be refused", .{});
+         return h;
+     }
+ 
+@@ -434,6 +574,8 @@ test "reasoning_effort and the thinking switches read as the Python app reads th
+     try std.testing.expectError(error.Refused, DeepSeek.thinkingFn(undefined, &cx, (try json.parseText(cx.a, "{\"chat_template_kwargs\": {\"thinking\": 1}}")).ok));
+ }
+ 
++const test_png = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAGCAIAAABxZ0isAAAAoUlEQVR4nAGWAGn/AAAAAB4eHjw8PFpaWnh4eJaWlrS0tNLS0gAHBwclJSVDQ0NhYWF/f3+dnZ27u7vZ2dkADg4OLCwsSkpKaGhohoaGpKSkwsLC4ODgABUVFTMzM1FRUW9vb42Njaurq8nJyefn5wAcHBw6OjpYWFh2dnaUlJSysrLQ0NDu7u4AIyMjQUFBX19ffX19m5ububm519fX9fX1CLhE6bQqUiMAAAAASUVORK5CYII=";
++
+ test "TF_DSV41_IMAGES=native: an image part becomes its span of virtual ids, held for the request (mini tokenizer)" {
+     const gpa = std.testing.allocator;
+     var arena = std.heap.ArenaAllocator.init(gpa);
+@@ -467,3 +609,134 @@ test "TF_DSV41_IMAGES=native: an image part becomes its span of virtual ids, hel
+     try std.testing.expect(std.mem.indexOfScalar(u32, got.ids, 1003) == null); // the typed placeholder stayed text
+     try std.testing.expectEqual(@as(u32, 12), img.llm_h); // 8 x 6 scaled up to 544^2: 630 x 476 -> 45 x 34 patches
+ }
++
++/// A fake video for the render tests: ``frames`` solid 8 x 6 frames at ``fps``, rows padded to 32 bytes.
++const FakeVideo = struct {
++    frames: u64 = 60,
++    fps: u64 = 30,
++    opened: usize = 0,
++    closed: usize = 0,
++
++    fn source(f: *FakeVideo) DeepSeek.VideoSource {
++        return .{ .ctx = f, .open = open };
++    }
++    fn open(ctx: ?*anyopaque, _: *Cx, _: []const u8, _: usize, _: *videos.Budget, _: ?images_mod.Fetch) errors.Refused!DeepSeek.Opened {
++        const f: *FakeVideo = @ptrCast(@alignCast(ctx.?));
++        f.opened += 1;
++        return .{ .src = .{ .frames = f.frames, .rate_num = f.fps, .rate_den = 1, .ctx = f, .decode = decode }, .ctx = f, .close = close };
++    }
++    fn decode(_: *anyopaque, indices: []const u32, sink: vision.video.Sink) anyerror!void {
++        var buf: [32 * 6]u8 = undefined;
++        for (indices, 0..) |idx, k| {
++            @memset(&buf, @truncate(idx * 5));
++            try sink.take(sink.ctx, k, &buf, 8, 6, 32);
++        }
++    }
++    fn close(ctx: *anyopaque) void {
++        const f: *FakeVideo = @ptrCast(@alignCast(ctx));
++        f.closed += 1;
++    }
++};
++
++/// A native DeepSeek side over the mini tokenizer with a test host (image id 1003) and ``max_images``.
++fn nativeForTest(gpa: Allocator, tok: *tokenizer.Tokenizer, max_images: u32) !*DeepSeek {
++    const d = try DeepSeek.init(gpa, tok, .{ .images = .native });
++    const vh = try gpa.create(vision.host.Host);
++    vh.* = vision.host.Host.init(gpa, std.testing.io, .{ .image_token = 1003, .max_images = max_images });
++    d.vision = vh;
++    d.io = std.testing.io;
++    return d;
++}
++
++const video_part = "{\"type\":\"video_url\",\"video_url\":{\"url\":\"data:video/mp4;base64,AAAA\"}}";
++const image_part = "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64," ++ test_png ++ "\"}}";
++
++fn userParts(a: Allocator, comptime parts_json: []const u8) !Value {
++    return (try json.parseText(a, "[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"what happens\"}," ++ parts_json ++ "]}]")).ok;
++}
++
++test "TF_DSV41_IMAGES=native: a video part is its frames, each a timestamp then its image span, within the image count" {
++    const gpa = std.testing.allocator;
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    var cx: Cx = .{ .a = arena.allocator() };
++    const tok = try serve.tokenizer.Tokenizer.parse(gpa, serve.fixtures.mini_tokenizer);
++    defer tok.deinit();
++    // 4 images a request, one of them an image: the 2 s video's 4 frames (2 a second) capped at 3
++    const d = try nativeForTest(gpa, tok, 4);
++    defer d.deinit(false);
++    var fake: FakeVideo = .{};
++    d.video_source = fake.source();
++    const got = try d.family_().render(&cx, .{ .messages = try userParts(cx.a, video_part ++ "," ++ image_part), .tools = &.{}, .thinking = false, .effort = "high", .body = .null });
++    const im = got.images orelse return error.NoImages;
++    defer im.release();
++    try std.testing.expectEqual(@as(usize, 1), fake.opened);
++    try std.testing.expectEqual(@as(usize, 1), fake.closed);
++    const h: *const vision.held.Held = @ptrCast(@alignCast(im.held));
++    try std.testing.expectEqual(@as(u64, 4), h.n); // 3 frames then the image, in prompt order
++    // the spans in order, each frame's preceded by its time: frames 10, 30, 50 of 60 at 30 fps
++    const want = [_][]const u8{ "0.3 seconds\n", "1.0 seconds\n", "1.7 seconds\n", "\n\n" };
++    var at: usize = 0;
++    for (h.slice(), want) |img, w| {
++        const start = std.mem.indexOfScalarPos(u32, got.ids, at, img.vids[0]) orelse return error.NoSpan;
++        try std.testing.expectEqualSlices(u32, img.vids[0..img.n_vids], got.ids[start .. start + img.n_vids]);
++        const before = try tok.decodeAlloc(cx.a, got.ids[at..start]);
++        try std.testing.expect(std.mem.endsWith(u8, before, w));
++        at = start + img.n_vids;
++    }
++    for (got.ids) |t| try std.testing.expect(t != 1003); // every placeholder expanded
++    try std.testing.expect(!std.mem.eql(u8, &h.slice()[0].digest, &h.slice()[1].digest));
++    // frame text alone: main's videos.seconds, a line a frame
++    try std.testing.expectEqualStrings("0.2 seconds\n" ++ vision.parts.IMAGE_PLACEHOLDER ++ "\n149.3 seconds\n" ++ vision.parts.IMAGE_PLACEHOLDER, try DeepSeek.frameText(cx.a, &.{ 0.25, 149.3 }));
++}
++
++test "TF_DSV41_IMAGES=native: video limits, and no libtfvideo refused with main's message" {
++    const gpa = std.testing.allocator;
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    var cx: Cx = .{ .a = arena.allocator() };
++    const tok = try serve.tokenizer.Tokenizer.parse(gpa, serve.fixtures.mini_tokenizer);
++    defer tok.deinit();
++    const d = try nativeForTest(gpa, tok, 1);
++    defer d.deinit(false);
++    var fake: FakeVideo = .{};
++    d.video_source = fake.source();
++    const p: family.Prompt = .{ .messages = try userParts(cx.a, video_part ++ "," ++ image_part), .tools = &.{}, .thinking = false, .effort = "high", .body = .null };
++    try std.testing.expectError(error.Refused, d.family_().render(&cx, p));
++    try std.testing.expectEqualStrings("2 images and videos in one request: at most 1 (TF_DSV41_VISION_MAX_IMAGES; a video's frames count as images)", cx.message);
++    const three: family.Prompt = .{ .messages = try userParts(cx.a, video_part ++ "," ++ video_part ++ "," ++ video_part), .tools = &.{}, .thinking = false, .effort = "high", .body = .null };
++    try std.testing.expectError(error.Refused, d.family_().render(&cx, three));
++    try std.testing.expectEqualStrings("a request supports at most 2 videos", cx.message);
++    try std.testing.expectEqual(@as(usize, 0), fake.opened);
++    // a video alone takes the whole count: one frame here (TF_DSV41_VISION_MAX_IMAGES=1)
++    const one = try d.family_().render(&cx, .{ .messages = try userParts(cx.a, video_part), .tools = &.{}, .thinking = false, .effort = "high", .body = .null });
++    const im = one.images orelse return error.NoImages;
++    defer im.release();
++    try std.testing.expectEqual(@as(u64, 1), @as(*const vision.held.Held, @ptrCast(@alignCast(im.held))).n);
++    // libtfvideo itself: absent on the test host, the request is refused with main's words
++    if (api.tfvideo.version() == null) {
++        d.video_source = DeepSeek.libtfvideo;
++        try std.testing.expectError(error.Refused, d.family_().render(&cx, .{ .messages = try userParts(cx.a, video_part), .tools = &.{}, .thinking = false, .effort = "high", .body = .null }));
++        try std.testing.expect(std.mem.startsWith(u8, cx.message, "video input needs libtfvideo (FFmpeg) beside the server"));
++    }
++}
++
++test "a video part under TF_DSV41_IMAGES=placeholder reads as the image notice; under reject it is refused" {
++    const gpa = std.testing.allocator;
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    var cx: Cx = .{ .a = arena.allocator() };
++    const tok = try serve.tokenizer.Tokenizer.parse(gpa, serve.fixtures.mini_tokenizer);
++    defer tok.deinit();
++    const messages = try userParts(cx.a, video_part);
++    const placeholder = try DeepSeek.init(gpa, tok, .{});
++    defer placeholder.deinit(false);
++    const got = try placeholder.family_().render(&cx, .{ .messages = messages, .tools = &.{}, .thinking = false, .effort = "high", .body = .null });
++    try std.testing.expectEqual(@as(u32, 1), got.images_omitted);
++    try std.testing.expect(got.images == null);
++    try std.testing.expect(std.mem.indexOf(u8, try tok.decodeAlloc(cx.a, got.ids), "what happens\n\n" ++ image_text) != null);
++    const reject = try DeepSeek.init(gpa, tok, .{ .images = .reject });
++    defer reject.deinit(false);
++    try std.testing.expectError(error.Refused, reject.family_().render(&cx, .{ .messages = messages, .tools = &.{}, .thinking = false, .effort = "high", .body = .null }));
++    try std.testing.expectEqualStrings("messages[0].content: videos are not served by this DeepSeek-V4.1 build", cx.message);
++}
+-- 
+2.43.0
+

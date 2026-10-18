@@ -1,0 +1,147 @@
+From 913b7d61fe58d52484edc96a9e573ba45049f1e3 Mon Sep 17 00:00:00 2001
+From: BobClawblaw <BobClawblaw@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 02:30:46 +0000
+Subject: [PATCH 5/9] server: keep the series' DeepSeek HTTP test (the kit's
+ runs a Spark wire this server does not have)
+
+---
+ zig/src/server/deepseek_test.zig | 59 ++++++++++++++------------------
+ 1 file changed, 25 insertions(+), 34 deletions(-)
+
+diff --git a/zig/src/server/deepseek_test.zig b/zig/src/server/deepseek_test.zig
+index 20604d91..a08f7758 100644
+--- a/zig/src/server/deepseek_test.zig
++++ b/zig/src/server/deepseek_test.zig
+@@ -1,6 +1,4 @@
+-//! DeepSeek-V4.1 served end to end over HTTP: a real listener and socket client, the family's tokenizer, encoding
+-//! and DSML reader, and a stub engine that answers each prompt with a scripted reply's token ids (in pieces of a few
+-//! tokens, then the end of sentence). Runs on the committed mini tokenizer; TF_DSV41_MODEL adds the release one.
++//! The DeepSeek serving side end to end over HTTP: real sockets, the family's text side, a stub engine's scripted ids.
+ const std = @import("std");
+ const api = @import("engine_api");
+ const json = @import("json");
+@@ -100,8 +98,6 @@ const Harness = struct {
+     thread: std.Thread = undefined,
+     port: u16 = 0,
+     lis: listener_mod.Listener = undefined,
+-    wire: @FieldType(server_mod.Config, "wire") = .tensorfold,
+-    log_path: ?[]const u8 = null,
+ 
+     fn start(h: *Harness, tok: *serve_mod.tokenizer.Tokenizer, eos: u32, window: u32, options: deepseek.Options) !void {
+         var o = options;
+@@ -113,8 +109,6 @@ const Harness = struct {
+             .model_ids = &.{"deepseek-v41"},
+             .default_sampling = null,
+             .family = h.ds.family_(),
+-            .wire = h.wire,
+-            .spark = .{ .log = if (h.log_path) |p| .{ .path = p } else null },
+         }, null);
+         h.lis = try listener_mod.Listener.open(.{ .ip4 = .loopback(0) });
+         h.port = h.lis.port();
+@@ -328,8 +322,7 @@ fn check(h: *Harness, a: Allocator) !void {
+         const want = try tok.encodeAlloc(a, try serve_mod.template.render(a, (try json.parseText(a, "[{\"role\":\"user\",\"content\":\"hi @think\"}]")).ok, .{}, &p));
+         try testing.expectEqual(@as(i64, @intCast(want.len)), v.get("count").?.int64().?);
+     }
+-    // 8. past the context window: OpenAI's code inside the stream on this (tensorfold) wire, as TensorFold 0.6.6; the
+-    // Spark wire answers 400 before the stream opens, as its Python server
++    // 8. past the context window: OpenAI's code inside the stream
+     {
+         const body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true,\"max_tokens\":100000}";
+         const r = try h.post(a, "/v1/chat/completions", body);
+@@ -365,11 +358,8 @@ test "DeepSeek-V4.1 over HTTP with the release tokenizer (TF_DSV41_MODEL)" {
+     try check(&h, arena.allocator());
+ }
+ 
+-/// History tool-call arguments as a client may resend them after a reply whose keys and values were corrupted: keys and values
+-/// of arbitrary bytes, as JSON text in the body. Lone surrogates (escaped, inside and outside the arguments' own JSON),
+-/// U+FFFD runs, control bytes, non-JSON, an empty key, a 5000-byte key, markup and quotes in a key, bad escapes,
+-/// arguments that are no string at all.
+-const history_arguments = [_][]const u8{
++/// History tool-call arguments of garbage bytes a client resends: surrogates, U+FFFD, controls, non-JSON, odd keys.
++const loop1_arguments = [_][]const u8{
+     \\"{\"\\udc80k\": \"v\\ud800\", \"\\ud83d\": \"\\ude00\"}"
+     ,
+     \\"{\"k\udc80\": 1, \"w\": \"\ud800\"}"
+@@ -410,18 +400,17 @@ const history_arguments = [_][]const u8{
+     ,
+ };
+ 
+-/// A long agent request: ~120 assistant turns with tool calls (reasoning on), each answered by a tool result, the last
+-/// result carrying ``marker`` for the stub.
+-fn historyBody(a: Allocator, marker: []const u8, stream: bool) ![]const u8 {
++/// A long agent history: ~120 tool-calling turns (reasoning on) and their results, the last carrying ``marker``.
++fn loop1Body(a: Allocator, marker: []const u8, stream: bool) ![]const u8 {
+     var b: std.ArrayList(u8) = .empty;
+     const long_key = try a.alloc(u8, 5000);
+     @memset(long_key, 'k');
+-    try b.appendSlice(a, "{\"model\":\"deepseek-v41\",\"messages\":[{\"role\":\"system\",\"content\":\"You are a coding agent.\"},{\"role\":\"user\",\"content\":\"fix the build\"}");
++    try b.appendSlice(a, "{\"model\":\"deepseek-v41\",\"messages\":[{\"role\":\"system\",\"content\":\"You are opencode.\"},{\"role\":\"user\",\"content\":\"fix the build\"}");
+     for (0..120) |i| {
+         const args = if (i % 23 == 22)
+             try std.fmt.allocPrint(a, "\"{{\\\"{s}\\\": \\\"x\\\"}}\"", .{long_key})
+         else
+-            history_arguments[i % history_arguments.len];
++            loop1_arguments[i % loop1_arguments.len];
+         const name = if (i % 7 == 6) "edit_unknown" else "bash";
+         try b.print(a, ",{{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"step {d} \\ud800\\u0000\\ufffd\",\"tool_calls\":[{{\"id\":\"call_{d}\",\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"arguments\":{s}}}}}]}}", .{ i, i, name, args });
+         const out = try a.alloc(u8, if (i % 40 == 0) 6791 else 300);
+@@ -447,11 +436,11 @@ fn abortMidStream(h: *Harness, a: Allocator, body: []const u8) !void {
+     _ = try r.interface.peek(1);
+ }
+ 
+-fn checkHistory(h: *Harness, a: Allocator) !void {
++fn checkLoop1(h: *Harness, a: Allocator) !void {
+     // streamed and whole, a reply with calls and a plain one: the server renders the history and answers
+     for ([_][]const u8{ "@tool", "@chat", "@think" }) |marker| for ([_]bool{ true, false }) |stream| {
+-        errdefer std.debug.print("long tool history, {s}, stream {}\n", .{ marker, stream });
+-        const r = try h.post(a, "/v1/chat/completions", try historyBody(a, marker, stream));
++        errdefer std.debug.print("long session shape, {s}, stream {}\n", .{ marker, stream });
++        const r = try h.post(a, "/v1/chat/completions", try loop1Body(a, marker, stream));
+         errdefer std.debug.print("{d}: {s}\n", .{ r.status, r.body[0..@min(r.body.len, 400)] });
+         try testing.expectEqual(@as(u16, 200), r.status);
+         const prompt = try h.lastPrompt(a);
+@@ -473,27 +462,29 @@ fn checkHistory(h: *Harness, a: Allocator) !void {
+         try testing.expect(r.status == 200 or r.status == 400);
+     }
+     // client aborts mid-stream, then the server still answers
+-    for (0..4) |_| try abortMidStream(h, a, try historyBody(a, "@tool", true));
++    for (0..4) |_| try abortMidStream(h, a, try loop1Body(a, "@tool", true));
+     const r = try h.post(a, "/v1/chat/completions", "{\"messages\":[{\"role\":\"user\",\"content\":\"hi @think\"}]}");
+     try testing.expectEqual(@as(u16, 200), r.status);
+ }
+ 
+-test "long tool history: 120 history calls with garbage arguments, both wires, a mid-stream abort (mini tokenizer)" {
++test "a long session's request shape: 120 history calls with garbage arguments, a mid-stream abort (mini tokenizer)" {
+     const gpa = testing.allocator;
+     const io = testing.io;
+     const tok = try serve_mod.tokenizer.Tokenizer.parse(gpa, serve_mod.fixtures.mini_tokenizer);
+     defer tok.deinit();
+-    var tmp = testing.tmpDir(.{});
+-    defer tmp.cleanup();
+     var arena = std.heap.ArenaAllocator.init(gpa);
+     defer arena.deinit();
+     const a = arena.allocator();
+-    const log_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/requests.jsonl", .{&tmp.sub_path});
+-    for ([_]@FieldType(server_mod.Config, "wire"){ .tensorfold, .spark }) |wire| {
+-        errdefer std.debug.print("wire {s}\n", .{@tagName(wire)});
+-        var h: Harness = .{ .gpa = gpa, .io = io, .stub = undefined, .ds = undefined, .srv = undefined, .wire = wire, .log_path = if (wire == .spark) log_path else null };
+-        try h.start(tok, tok.tokenId("<｜end▁of▁sentence｜>").?, 1 << 22, .{});
+-        defer h.finish();
+-        try checkHistory(&h, a);
+-    }
++    var h: Harness = .{ .gpa = gpa, .io = io, .stub = undefined, .ds = undefined, .srv = undefined };
++    try h.start(tok, tok.tokenId("<｜end▁of▁sentence｜>").?, 1 << 22, .{});
++    defer h.finish();
++    try checkLoop1(&h, a);
++}
++
++test "a load without tokenizer.json names the file in the caller's problem arena, and the general allocator keeps nothing" {
++    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
++    defer arena.deinit();
++    var problem: []const u8 = "";
++    try testing.expectError(error.Load, deepseek.DeepSeek.load(testing.allocator, testing.io, "/nonexistent-dsv41-dir", .{}, arena.allocator(), &problem));
++    try testing.expect(std.mem.indexOf(u8, problem, "/nonexistent-dsv41-dir/tokenizer.json") != null);
+ }
+-- 
+2.43.0
+

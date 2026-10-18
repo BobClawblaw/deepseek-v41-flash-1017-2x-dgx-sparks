@@ -1,0 +1,104 @@
+From 7d00d2df687c5d05da523ace11f9a7ca34c2e258 Mon Sep 17 00:00:00 2001
+From: BobClawblaw <BobClawblaw@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 02:22:10 +0000
+Subject: [PATCH 3/9] deepseek_v41 (kit) on main's runtime and lane host:
+ Memcpy2D field names, no GraphsSource or Rounds.leaving, structural tags
+ refused
+
+---
+ zig/src/families/deepseek_v41/dspark_dev.zig   | 12 ++++++------
+ zig/src/families/deepseek_v41/grammar_gpu.zig  | 13 +++++++++----
+ zig/src/families/deepseek_v41/sched_host.zig   |  2 +-
+ zig/src/families/deepseek_v41/serve_engine.zig |  3 +--
+ 4 files changed, 17 insertions(+), 13 deletions(-)
+
+diff --git a/zig/src/families/deepseek_v41/dspark_dev.zig b/zig/src/families/deepseek_v41/dspark_dev.zig
+index 92359514..37293069 100644
+--- a/zig/src/families/deepseek_v41/dspark_dev.zig
++++ b/zig/src/families/deepseek_v41/dspark_dev.zig
+@@ -377,12 +377,12 @@ pub const Chain = struct {
+         var cs: [32]Copy2D = undefined;
+         for (reorder(world, rows, k, at, &cs)) |cp| {
+             const p: cuda.abi.Memcpy2D = .{
+-                .srcDevice = gathered + cp.src,
+-                .srcPitch = cp.src_pitch,
+-                .dstDevice = (if (cp.ids) x.bufs[0].ptr else x.bufs[1].ptr) + cp.dst,
+-                .dstPitch = cp.dst_pitch,
+-                .WidthInBytes = cp.width,
+-                .Height = cp.height,
++                .src = gathered + cp.src,
++                .src_pitch = cp.src_pitch,
++                .dst = (if (cp.ids) x.bufs[0].ptr else x.bufs[1].ptr) + cp.dst,
++                .dst_pitch = cp.dst_pitch,
++                .width = cp.width,
++                .height = cp.height,
+             };
+             try r.d.check(r.d.api.cuMemcpy2DAsync_v2(&p, r.stream.handle), "cuMemcpy2DAsync");
+         }
+diff --git a/zig/src/families/deepseek_v41/grammar_gpu.zig b/zig/src/families/deepseek_v41/grammar_gpu.zig
+index 507383ae..903510ca 100644
+--- a/zig/src/families/deepseek_v41/grammar_gpu.zig
++++ b/zig/src/families/deepseek_v41/grammar_gpu.zig
+@@ -702,15 +702,16 @@ pub const GrammarEngine = struct {
+         return self(ctx).inner.memory(reset_peak);
+     }
+ 
+-    /// The request's spec in grammar's terms (``structured.Host.spec``), or null for plain text.
+-    pub fn specOf(s: api.Structure) grammar.Spec {
++    /// The request's spec in grammar's terms (``structured.Host.spec``); null: a kind this engine's grammars do not
++    /// enforce (the server's structural tags, which tool_choice "required" sends).
++    pub fn specOf(s: api.Structure) ?grammar.Spec {
+         const kind: grammar.Kind = switch (s.kind) {
+             .json => .json,
+             .json_schema => .json_schema,
+             .regex => .regex,
+             .choice => .choice,
+             .grammar => .grammar,
+-            .tools => .tools,
++            .structural_tag => return null,
+         };
+         return .{ .kind = kind, .text = s.text };
+     }
+@@ -720,7 +721,11 @@ pub const GrammarEngine = struct {
+         const r = e.gpa.create(Registration) catch return error.Busy;
+         r.* = .{ .id = id, .prompt = request.prompt, .spec = .{ .kind = .json }, .compiled = null, .sink = sink, .owner = e };
+         if (request.structure) |s| {
+-            r.spec = specOf(s);
++            r.spec = specOf(s) orelse {
++                e.gpa.destroy(r);
++                sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .failed, .message = "the grammar cannot be enforced: DeepSeek-V4.1's grammars do not take structural tags (tool_choice \"required\")" } });
++                return;
++            };
+             var why: grammar.Grammars.Why = .{};
+             r.compiled = e.g.compile(r.spec, &why) catch {
+                 e.gpa.destroy(r);
+diff --git a/zig/src/families/deepseek_v41/sched_host.zig b/zig/src/families/deepseek_v41/sched_host.zig
+index fabdb3fa..fce6b909 100644
+--- a/zig/src/families/deepseek_v41/sched_host.zig
++++ b/zig/src/families/deepseek_v41/sched_host.zig
+@@ -64,7 +64,7 @@ pub const SchedHost = struct {
+     }
+ 
+     pub fn rounds(h: *SchedHost) api.Rounds {
+-        return .{ .ctx = h, .vtable = &.{ .begin_admit = beginAdmit, .admit = admit, .admitted = admitted, .arm = arm, .began = began, .plan = plan, .left = left, .after = after, .leaving = leaving } };
++        return .{ .ctx = h, .vtable = &.{ .begin_admit = beginAdmit, .admit = admit, .admitted = admitted, .arm = arm, .began = began, .plan = plan, .left = left, .after = after } }; // the kit's `leaving` (a cancelled prompt's prefix kept) is not in this lane host
+     }
+ 
+     pub fn describe(h: *const SchedHost, buf: []u8) []const u8 {
+diff --git a/zig/src/families/deepseek_v41/serve_engine.zig b/zig/src/families/deepseek_v41/serve_engine.zig
+index dafcce22..dba3e9df 100644
+--- a/zig/src/families/deepseek_v41/serve_engine.zig
++++ b/zig/src/families/deepseek_v41/serve_engine.zig
+@@ -151,8 +151,7 @@ pub const Served = struct {
+         s.host.on_thread = .{ .ctx = m, .run = bindContext };
+         // /metrics' device memory: the bytes this rank holds in cuda.DeviceBuffers (weights, KV pool, staging), its peak
+         s.host.memory = .{ .read = readMemory };
+-        // /health's "graphs": each graph cache's held graphs, captures, replays, eager steps and floor state
+-        s.host.graphs = .{ .read = readGraphs };
++        // /health's "graphs" (the kit's GraphsSource) is not in this LaneHost: readGraphs stays for the logs only
+         // TF_DSV41_PREFILL_PIECES=1: prod's batcher plans the rounds (queued admissions, prompts in pieces between
+         // decode rounds); the served shape only (own prefill, the verify tail), every rank with the same setting
+         s.sched = null;
+-- 
+2.43.0
+

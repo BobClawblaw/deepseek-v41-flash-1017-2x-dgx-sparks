@@ -1,0 +1,378 @@
+From 6b99c572d78f7ecd9cb357f7cd019f4f928e399f Mon Sep 17 00:00:00 2001
+From: BobClawblaw <BobClawblaw@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 02:22:10 +0000
+Subject: [PATCH 4/9] server: TF_DSV41_IMAGES=native on main's server: the
+ family's held images reach the engine as Request.family_images
+
+---
+ zig/src/core/engine_api.zig                   |   3 +
+ zig/src/families/deepseek_v41/vision_rows.zig |   2 +-
+ zig/src/server/chat.zig                       |   1 +
+ zig/src/server/deepseek.zig                   | 246 ++----------------
+ 4 files changed, 21 insertions(+), 231 deletions(-)
+
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 8e1cf73b..afa2e67b 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -97,6 +97,9 @@ pub const Request = struct {
+     images: []const Image = &.{},
+     /// The prompt as the prompt cache matches it (each image's placeholders by its content); empty: ``prompt``.
+     cache_key: []const u32 = &.{},
++    /// A family's own prepared images (DeepSeek-V4.1's ``vision/held.zig`` on rank 0), held by the server until the
++    /// request's ``finished`` event; null: none (every other family).
++    family_images: ?*const anyopaque = null,
+ 
+     /// The prompt as the prompt cache matches it: an image request's placeholders stand for their images.
+     pub fn cacheKey(r: *const Request) []const u32 {
+diff --git a/zig/src/families/deepseek_v41/vision_rows.zig b/zig/src/families/deepseek_v41/vision_rows.zig
+index cb5fd02d..08036881 100644
+--- a/zig/src/families/deepseek_v41/vision_rows.zig
++++ b/zig/src/families/deepseek_v41/vision_rows.zig
+@@ -241,7 +241,7 @@ pub const Engine = struct {
+ 
+     fn submit(ctx: *anyopaque, id: api.Id, request: *const api.Request, sink: api.Sink) api.SubmitError!void {
+         const e = self(ctx);
+-        const h: *const held.Held = @ptrCast(@alignCast(request.images orelse return e.inner.submit(id, request, sink)));
++        const h: *const held.Held = @ptrCast(@alignCast(request.family_images orelse return e.inner.submit(id, request, sink)));
+         e.rows.hold(id, h) catch return error.Busy;
+         {
+             e.mutex.lockUncancelable(e.rows.io);
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 1cd25e16..91844c98 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -156,6 +156,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+         .tools_json = if (input.tools.len > 0) try json.stringify(a, .{ .array = @constCast(input.tools) }, .{ .ascii = false }) else "",
+         .decide = if (input.prompt == null and !background) prompt_mod.decideOf(srv, rendered.ids) else null,
+         .images = rendered.images,
++        .family_images = if (rendered.family_images) |im| im.held else null,
+         .cache_key = rendered.cache_key,
+     };
+     try srv.checkFeatures(cx, f, input.tools.len > 0, thinking, rendered.ids, input.tools, &request);
+diff --git a/zig/src/server/deepseek.zig b/zig/src/server/deepseek.zig
+index c04e0f48..9f15ad51 100644
+--- a/zig/src/server/deepseek.zig
++++ b/zig/src/server/deepseek.zig
+@@ -27,7 +27,10 @@ const Cx = errors.Cx;
+ const Allocator = std.mem.Allocator;
+ const tokenizer = serve.tokenizer;
+ const template = serve.template;
+-const tools_mod = serve.tools;
++pub const tools_mod = serve.tools;
++const deepseek_session = @import("deepseek_session.zig");
++const Memory = deepseek_session.Memory;
++const Reply = deepseek_session.Reply;
+ const vision = serve.vision;
+ 
+ pub const model_type = "deepseek_v41";
+@@ -84,7 +87,7 @@ pub const Options = struct {
+     }
+ };
+ 
+-/// A ``reasoning_effort`` value as a budget (``template.effortOf``: the Python app's names).
++/// A ``reasoning_effort`` value as a budget (``template.effortOf``'s names).
+ const level = template.effortOf;
+ 
+ /// The budget an effort label renders (defaults to high).
+@@ -92,114 +95,7 @@ pub fn budget(label: []const u8) u8 {
+     return ((level(label) orelse return template.default_budget) orelse template.default_budget);
+ }
+ 
+-/// Python's reasoning memory (GLM 0620): reasoning by tool-call id or content digest, oldest dropped first.
+-const Memory = struct {
+-    gpa: Allocator,
+-    entries: usize,
+-    lock: std.atomic.Value(bool) = .init(false),
+-    map: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
+-
+-    fn acquire(m: *Memory) void {
+-        while (m.lock.swap(true, .acquire)) std.atomic.spinLoopHint();
+-    }
+-    fn release(m: *Memory) void {
+-        m.lock.store(false, .release);
+-    }
+-
+-    fn contentKey(buf: *[66]u8, content: []const u8) []const u8 {
+-        var d: [32]u8 = undefined;
+-        std.crypto.hash.sha2.Sha256.hash(content, &d, .{});
+-        buf[0] = 'c';
+-        buf[1] = ':';
+-        _ = std.fmt.bufPrint(buf[2..], "{x}", .{d}) catch unreachable;
+-        return buf[0..66];
+-    }
+-
+-    fn put(m: *Memory, reasoning: []const u8, content: []const u8, calls: []const Value) void {
+-        if (reasoning.len == 0 or m.entries == 0) return;
+-        m.acquire();
+-        defer m.release();
+-        var buf: [66]u8 = undefined;
+-        var keys_buf: [64][]const u8 = undefined;
+-        var keys: []const []const u8 = keys_buf[0..0];
+-        var n: usize = 0;
+-        for (calls) |c| if (c.strField("id")) |id| if (n < keys_buf.len) {
+-            keys_buf[n] = id;
+-            n += 1;
+-        };
+-        keys = keys_buf[0..n];
+-        if (n == 0) {
+-            keys_buf[0] = contentKey(&buf, content);
+-            keys = keys_buf[0..1];
+-        }
+-        const value = m.gpa.dupe(u8, reasoning) catch return;
+-        var used = false;
+-        for (keys) |k| {
+-            if (m.map.fetchOrderedRemove(k)) |old| {
+-                m.gpa.free(old.key);
+-                m.gpa.free(old.value);
+-            }
+-            const key = m.gpa.dupe(u8, k) catch continue;
+-            const v = if (used) m.gpa.dupe(u8, reasoning) catch {
+-                m.gpa.free(key);
+-                continue;
+-            } else value;
+-            used = true;
+-            m.map.put(m.gpa, key, v) catch {
+-                m.gpa.free(key);
+-                m.gpa.free(v);
+-            };
+-        }
+-        if (!used) m.gpa.free(value);
+-        while (m.map.count() > m.entries) {
+-            const k = m.map.keys()[0];
+-            const v = m.map.values()[0];
+-            m.map.orderedRemoveAt(0);
+-            m.gpa.free(k);
+-            m.gpa.free(v);
+-        }
+-    }
+-
+-    /// A copy of ``messages`` with remembered reasoning put back where an assistant message lacks it.
+-    fn restore(m: *Memory, a: Allocator, messages: Value) Allocator.Error!Value {
+-        if (messages != .array or m.map.count() == 0) return messages;
+-        var out: ?[]Value = null;
+-        m.acquire();
+-        defer m.release();
+-        for (messages.array, 0..) |msg, i| {
+-            if (msg != .object) continue;
+-            const role = msg.get("role") orelse continue;
+-            if (role != .string or !std.mem.eql(u8, role.string, "assistant")) continue;
+-            const rc: Value = msg.get("reasoning_content") orelse .null;
+-            const rs: Value = msg.get("reasoning") orelse .null;
+-            if (rc.truthy() or rs.truthy()) continue;
+-            var key: ?[]const u8 = null;
+-            var buf: [66]u8 = undefined;
+-            if (msg.get("tool_calls")) |tc| if (tc == .array and tc.array.len > 0 and tc.array[0] == .object) if (tc.array[0].get("id")) |id| if (id == .string and id.string.len > 0) {
+-                key = id.string;
+-            };
+-            if (key == null) if (msg.get("content")) |c| if (c == .string) {
+-                key = contentKey(&buf, c.string);
+-            };
+-            const got = m.map.get(key orelse continue) orelse continue;
+-            if (out == null) out = try a.dupe(Value, messages.array);
+-            const copy = try json.copyObject(a, msg.object);
+-            try copy.put(a, "reasoning_content", .{ .string = try a.dupe(u8, got) });
+-            out.?[i] = .{ .object = copy };
+-        }
+-        return if (out) |o| .{ .array = o } else messages;
+-    }
+-
+-    fn deinit(m: *Memory) void {
+-        for (m.map.keys(), m.map.values()) |k, v| {
+-            m.gpa.free(k);
+-            m.gpa.free(v);
+-        }
+-        m.map.deinit(m.gpa);
+-    }
+-};
+-
+-/// The DeepSeek-V4.1 serving side of one checkpoint: its tokenizer, the encoding and the family rules.
++/// The serving side of one checkpoint: its tokenizer, the encoding and the family rules.
+ pub const DeepSeek = struct {
+     gpa: Allocator,
+     tok: *tokenizer.Tokenizer,
+@@ -210,15 +106,17 @@ pub const DeepSeek = struct {
+     vision: ?*vision.host.Host = null,
+     io: ?std.Io = null,
+ 
+-    pub fn load(gpa: Allocator, io: std.Io, dir: []const u8, options: Options, problem: *[]const u8) !*DeepSeek {
++    /// `pa` owns a failure's `problem` text (the caller's problem arena), so a refused load leaks nothing.
++    pub fn load(gpa: Allocator, io: std.Io, dir: []const u8, options: Options, pa: Allocator, problem: *[]const u8) !*DeepSeek {
+         const d = try gpa.create(DeepSeek);
+         errdefer gpa.destroy(d);
+         const tok = tokenizer.Tokenizer.load(gpa, io, dir) catch |e| {
+-            problem.* = try std.fmt.allocPrint(gpa, "cannot read {s}/tokenizer.json ({s})", .{ dir, @errorName(e) });
++            problem.* = try std.fmt.allocPrint(pa, "cannot read {s}/tokenizer.json ({s})", .{ dir, @errorName(e) });
+             return error.Load;
+         };
++        errdefer tok.deinit();
+         d.* = .{ .gpa = gpa, .tok = tok, .options = options, .memory = .{ .gpa = gpa, .entries = options.memory_entries }, .io = io };
+-        if (options.images == .native) d.vision = try openVision(gpa, io, dir, options.env, problem);
++        if (options.images == .native) d.vision = try openVision(gpa, io, dir, options.env, pa, problem);
+         return d;
+     }
+ 
+@@ -321,7 +219,7 @@ pub const DeepSeek = struct {
+         };
+     }
+ 
+-    // -- family.Family -------------------------------------------------------------------------------------------------
++    // -- family.Family ------------------------------------------------------------------------------------------
+ 
+     pub fn family_(d: *DeepSeek) family.Family {
+         return .{ .ctx = d, .vt = switch (d.options.reasoning_fields) {
+@@ -341,8 +239,7 @@ pub const DeepSeek = struct {
+         } };
+     }
+ 
+-    /// ``options``: ``reasoning_effort`` (top level, then ``chat_template_kwargs``), then ``enable_thinking`` and
+-    /// ``thinking`` in ``chat_template_kwargs``.
++    /// ``options``: ``reasoning_effort`` (top level, then template kwargs), then ``enable_thinking`` / ``thinking``.
+     fn thinkingFn(_: *anyopaque, cx: *Cx, body: Value) errors.Refused!family.Thinking {
+         var out: family.Thinking = .{};
+         const kwargs = body.get("chat_template_kwargs") orelse Value.null;
+@@ -476,7 +373,7 @@ pub const DeepSeek = struct {
+         }
+     };
+ 
+-    fn openVision(gpa: Allocator, io: std.Io, dir: []const u8, env: ?*const std.process.Environ.Map, problem: *[]const u8) !*vision.host.Host {
++    fn openVision(gpa: Allocator, io: std.Io, dir: []const u8, env: ?*const std.process.Environ.Map, pa: Allocator, problem: *[]const u8) !*vision.host.Host {
+         const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
+         defer gpa.free(path);
+         const cfg = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 24)) catch null;
+@@ -485,7 +382,7 @@ pub const DeepSeek = struct {
+         arena.* = std.heap.ArenaAllocator.init(gpa);
+         var msg: []const u8 = "";
+         const s = vision.prep.Settings.read(arena.allocator(), if (cfg) |c| try arena.allocator().dupe(u8, c) else null, env, &msg) catch |e| {
+-            problem.* = try std.fmt.allocPrint(gpa, "TF_DSV41_IMAGES=native: {s} ({t})", .{ msg, e });
++            problem.* = try std.fmt.allocPrint(pa, "TF_DSV41_IMAGES=native: {s} ({t})", .{ msg, e });
+             return error.Load;
+         };
+         const h = try gpa.create(vision.host.Host);
+@@ -516,122 +413,11 @@ pub const DeepSeek = struct {
+         return .{ .ctx = r, .vt = &.{ .push = Reply.push, .pending = Reply.pending, .feed = Reply.feed, .parse = Reply.parse, .calls = Reply.calls, .markup = Reply.markup } };
+     }
+ 
+-    fn callId(_: ?*anyopaque, a: Allocator, _: usize) Allocator.Error![]const u8 {
++    pub fn callId(_: ?*anyopaque, a: Allocator, _: usize) Allocator.Error![]const u8 {
+         return ids_mod.make(a, "call_", 24);
+     }
+ };
+ 
+-/// One reply's text and DSML stream (``family.Reader``).
+-const Reply = struct {
+-    a: Allocator,
+-    d: *DeepSeek,
+-    detok: tokenizer.Detokenizer,
+-    text: std.ArrayList(u8) = .empty,
+-    stream: tools_mod.Stream,
+-    deltas: std.ArrayList(tools_mod.Delta) = .empty,
+-    thinking: bool,
+-    offered: tools_mod.Tools,
+-    single: bool,
+-    flushed: bool = false,
+-
+-    fn self(ctx: *anyopaque) *Reply {
+-        return @ptrCast(@alignCast(ctx));
+-    }
+-
+-    fn push(ctx: *anyopaque, ids: []const u32) Allocator.Error!void {
+-        const r = self(ctx);
+-        for (ids) |id| try r.detok.push(r.a, id, &r.text);
+-    }
+-
+-    fn pending(ctx: *anyopaque) bool {
+-        return self(ctx).detok.pending();
+-    }
+-
+-    fn feed(ctx: *anyopaque, finished: bool, out: *std.ArrayList(Value)) Allocator.Error!void {
+-        const r = self(ctx);
+-        const a = r.a;
+-        if (finished and !r.flushed) {
+-            try r.detok.flush(a, &r.text);
+-            r.flushed = true;
+-        }
+-        r.deltas.clearRetainingCapacity();
+-        try r.stream.feed(r.text.items, finished, &r.deltas);
+-        const fam = r.d.family_();
+-        for (r.deltas.items) |delta| switch (delta) {
+-            .reasoning => |t| try out.append(a, try fam.reasoningDelta(a, t)),
+-            .content => |t| try out.append(a, .{ .string = t }),
+-            .call => |c| {
+-                if (r.single and c.index > 0) continue;
+-                const f = try json.newObject(a);
+-                try f.put(a, "name", .{ .string = c.name });
+-                try f.put(a, "arguments", .{ .string = "" });
+-                const call = try json.newObject(a);
+-                try call.put(a, "index", try json.intValue(a, c.index));
+-                try call.put(a, "id", .{ .string = c.id });
+-                try call.put(a, "type", .{ .string = "function" });
+-                try call.put(a, "function", .{ .object = f });
+-                try out.append(a, try toolCallsDelta(a, .{ .object = call }));
+-            },
+-            .arguments => |g| {
+-                if (r.single and g.index > 0) continue;
+-                const f = try json.newObject(a);
+-                try f.put(a, "arguments", .{ .string = try a.dupe(u8, g.text) });
+-                const call = try json.newObject(a);
+-                try call.put(a, "index", try json.intValue(a, g.index));
+-                try call.put(a, "function", .{ .object = f });
+-                try out.append(a, try toolCallsDelta(a, .{ .object = call }));
+-            },
+-        };
+-    }
+-
+-    fn toolCallsDelta(a: Allocator, call: Value) Allocator.Error!Value {
+-        const list = try a.alloc(Value, 1);
+-        list[0] = call;
+-        const o = try json.newObject(a);
+-        try o.put(a, "tool_calls", .{ .array = list });
+-        return .{ .object = o };
+-    }
+-
+-    fn openai(a: Allocator, c: *const tools_mod.Call) Allocator.Error!Value {
+-        const f = try json.newObject(a);
+-        try f.put(a, "name", .{ .string = c.name });
+-        try f.put(a, "arguments", .{ .string = try c.arguments(a) });
+-        const o = try json.newObject(a);
+-        try o.put(a, "id", .{ .string = c.id });
+-        try o.put(a, "type", .{ .string = "function" });
+-        try o.put(a, "function", .{ .object = f });
+-        return .{ .object = o };
+-    }
+-
+-    fn markup(ctx: *anyopaque) Allocator.Error!?family.Markup {
+-        const r = self(ctx);
+-        const n = try tools_mod.note(r.a, r.text.items, r.thinking, r.offered) orelse return null;
+-        return .{ .at = n.at, .reason = n.reason, .window = n.window };
+-    }
+-
+-    fn parse(ctx: *anyopaque) Allocator.Error!family.Parsed {
+-        const r = self(ctx);
+-        if (!r.flushed) {
+-            try r.detok.flush(r.a, &r.text);
+-            r.flushed = true;
+-        }
+-        const p = try tools_mod.parse(r.a, r.text.items, r.thinking, r.offered, .{ .make = DeepSeek.callId });
+-        const n = if (r.single) @min(1, p.calls.len) else p.calls.len;
+-        const list = try r.a.alloc(Value, n);
+-        for (p.calls[0..n], list) |*c, *slot| slot.* = try openai(r.a, c);
+-        return .{ .reasoning = p.reasoning, .content = p.content, .calls = list };
+-    }
+-
+-    fn calls(ctx: *anyopaque) Allocator.Error![]Value {
+-        const r = self(ctx);
+-        const all = r.stream.calls.items;
+-        const n = if (r.single) @min(1, all.len) else all.len;
+-        const out = try r.a.alloc(Value, n);
+-        for (all[0..n], out) |*c, *slot| slot.* = try openai(r.a, c);
+-        return out;
+-    }
+-};
+-
+ test "reasoning_effort and the thinking switches read as the Python app reads them" {
+     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+     defer arena.deinit();
+-- 
+2.43.0
+
