@@ -1,11 +1,11 @@
 # DeepSeek-V4.1-Flash-1017 at EXL3 2.9 bpw (LibertAIDAI's pack, Mia-AiLab's layout) on two DGX Sparks at TP=2,
 # served by jayleaton's recipe (github.com/jayleaton/deepseek-v41-tensorfold-spark, Python engine: TensorFold 0.6.0 +
 # its patches). The ruler is the GLM EXL3 recipe's (any OpenAI endpoint). Machine paths go in the .local.toml.
-name = "dsv41-1017-gb10-native-vision"
-description = "DeepSeek-V4.1-Flash-1017 EXL3 2.9 bpw on native TensorFold (main + jayleaton's kit engine 9131e10a ported onto it), native images and video, TP=2 on two DGX Sparks, 4 slots, pool 200K"
+name = "dsv41-1017-gb10-native-vision8"
+description = "DeepSeek-V4.1-Flash-1017 EXL3 2.9 bpw on native TensorFold (main + the kit engine), native images and video, TP=2 on two DGX Sparks, 8 slots, pool 400K, prefill-dip reserve 2 GiB"
 model_name = "DeepSeek-V4.1-Flash-1017 EXL3 2.9bpw"
 hardware = "2x NVIDIA DGX Spark (GB10, 128 GB unified each), TP=2 over RoCE"
-engine = "TensorFold native (Zig, CUDA): main 9ccf4727 + the DeepSeek-V4.1 kit engine, vision tower (TF_DSV41_IMAGES=native), video as sampled frames, DSpark drafts"
+engine = "TensorFold native (Zig, CUDA): main 9ccf4727 + the DeepSeek-V4.1 kit engine, vision tower, video as frames, DSpark drafts, 8 slots"
 url = "http://127.0.0.1:$port"
 model = "DeepSeek-V4.1-Flash-TF"
 

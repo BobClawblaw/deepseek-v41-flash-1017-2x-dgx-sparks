@@ -1,0 +1,11 @@
+description = "About 20 minutes, on the server as it is (no restart): the ruler at 1, 2, 4 and 8 streams"
+restart = false
+
+[[checks]]
+type = "memory"
+name = "memory-idle"
+
+[[checks]]
+type = "ruler"
+label = "streams"
+concurrency = [1, 2, 4, 8]

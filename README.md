@@ -37,14 +37,17 @@ TensorFold's main branch has no DeepSeek-V4.1 family yet. This recipe builds one
 ## Measured
 
 Recipe harness ([recipe-harness](https://github.com/BobClawblaw/recipe-harness)), target
-`harness/dsv41-1017-gb10-native-vision.toml`, plan `harness/dsv41-speed.toml`, on two DGX Sparks. Settings: 4 slots,
+`harness/dsv41-1017-gb10-native-vision8.toml`, plan `harness/dsv41-speed8.toml`, on two DGX Sparks. Settings: 8 slots,
 DSpark drafts, native images. Aggregate tok/s for prose / code / structured / list, then first-text latency:
 
 | Streams | tok/s | First text |
 |---|---|---|
-| 1 | 55.2 / 100.4 / 62.5 / 71.4 | 0.19-0.26 s |
-| 2 | 81.0 / 124.9 / 84.2 / 143.6 | 0.31-0.40 s |
-| 4 | 106.5 / 161.6 / 111.9 / 178.7 | 0.73-0.99 s |
+| 1 | 55.4 / 103.5 / 62.7 / 70.9 | 0.19-0.26 s |
+| 2 | 81.5 / 126.2 / 89.4 / 142.7 | 0.30-0.48 s |
+| 4 | 108.8 / 163.8 / 113.7 / 180.4 | 0.71-0.85 s |
+| 8 | 134.8 / 202.7 / 143.6 / 203.3 | 1.35-1.84 s |
+
+8 slots with a 400K pool and a 2 GiB prefill-dip reserve (`config/native.env.example`, harness plan `harness/dsv41-speed8.toml`). With 4 slots and the kit's 3 GiB reserve the pool had to stay at 200K, and 4 streams measured 106.5 / 161.6 / 111.9 / 178.7.
 
 The same build without the vision tower (the series alone) measured 98.1 / 158.5 tok/s on code at 1 / 4 streams.
 
@@ -106,10 +109,11 @@ results go here.
 
 ## Known issues
 
-- **A small KV pool.** With the vision tower loaded, the engine's boot gate passed a shared pool of only
-  `TF_DSV41_POOL_TOKENS=200000` positions on this pack, across the 4 slots. Without images it was 900K. Long prompts
-  run in 2,048-row prefill segments at the tightest point. The gate prints the largest pool that fits when it refuses
-  one.
+- **A small KV pool.** With the vision tower loaded, rank 0 is the tight rank. At the kit's 3 GiB prefill-dip reserve,
+  the boot gate passed only 200K pool positions for 4 slots, and that was within 0.01 GiB of its floor. This config
+  lowers the reserve to 2 GiB (`TF_DSV41_SERVE_DIP_GIB`) for 8 slots and a 400K pool, which leaves ~0.7 GiB of margin.
+  Long prompts still run in 2,048-row prefill segments at the tightest point. The gate prints the largest pool that
+  fits when it refuses one.
 - **The worker's driver after a failed start.** On our pair, every start that failed (a memory-gate refusal, a missing
   kernel variant) left the worker's NVIDIA driver logging `NV_ERR_NO_MEMORY`. The next start then failed in NCCL's
   memory registration (`ibv_reg_mr ... Cannot allocate memory`) until the worker was rebooted. Reboot it before
